@@ -108,10 +108,13 @@ class PlaceCandidate(BaseModel):
     formattedAddress: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    distanceMeters: Optional[int] = None  # Distance from search center
+    hasValidPhone: bool = False  # True only after details confirms valid phone
 
 
 class PlaceSearchResponse(BaseModel):
     """Response from place search."""
+    passNumber: int = 1  # 1=25km, 2=50km, 3=100km
     radiusKm: int
     candidates: List[PlaceCandidate]
     error: Optional[str] = None
@@ -130,3 +133,122 @@ class PlaceDetailsResponse(BaseModel):
     formattedAddress: Optional[str] = None
     phoneE164: Optional[str] = None  # E.164 format, None if no valid phone
     error: Optional[str] = None  # "NO_PHONE", "PLACE_NOT_FOUND", etc.
+
+
+# ============================================================
+# Geocode Models (standalone geocoding endpoint)
+# ============================================================
+
+class GeocodeRequest(BaseModel):
+    """Request to geocode an area name."""
+    area: str
+    country: str = "AU"
+
+
+class GeocodeResponse(BaseModel):
+    """Response from geocoding."""
+    latitude: float
+    longitude: float
+    formattedAddress: str
+    error: Optional[str] = None
+
+
+# ============================================================
+# Call Brief Models (Screen 4 - OpenAI generates call script)
+# ============================================================
+
+class CallBriefPlace(BaseModel):
+    """Place information for call brief."""
+    placeId: str
+    businessName: str
+    formattedAddress: Optional[str] = None
+    phoneE164: str
+
+
+class CallBriefDisclosure(BaseModel):
+    """User disclosure settings for the call."""
+    nameShare: bool = False
+    phoneShare: bool = False
+
+
+class CallBriefFallbacks(BaseModel):
+    """Fallback behaviors during the call (agent-specific)."""
+    # Stock Checker fallbacks
+    askETA: Optional[bool] = None
+    askNearestStore: Optional[bool] = None
+    # Restaurant reservation fallbacks
+    retryIfNoAnswer: Optional[bool] = None
+    retryIfBusy: Optional[bool] = None
+    leaveVoicemail: Optional[bool] = None
+
+
+class CallBriefRequestV2(BaseModel):
+    """Request to generate a call brief."""
+    conversationId: str
+    agentType: str  # "STOCK_CHECKER" or "RESTAURANT_RESERVATION"
+    place: CallBriefPlace
+    slots: Dict[str, Any] = Field(default_factory=dict)
+    disclosure: CallBriefDisclosure = Field(default_factory=CallBriefDisclosure)
+    fallbacks: CallBriefFallbacks = Field(default_factory=CallBriefFallbacks)
+    debug: bool = False
+
+
+class CallBriefResponseV2(BaseModel):
+    """Response containing the call brief."""
+    objective: str  # Short description of call goal
+    scriptPreview: str  # Plain text, multi-line, no markdown
+    confirmationChecklist: List[str]  # 2-6 items user should verify
+    normalizedPhoneE164: str  # Validated/normalized phone
+    requiredFieldsMissing: List[str]  # Empty if all required fields present
+    aiCallMade: bool
+    aiModel: str
+
+
+# ============================================================
+# Call Start Models (Screen 4 - Stub for Step 3)
+# ============================================================
+
+class CallStartRequestV2(BaseModel):
+    """Request to start a call (stub in Step 3)."""
+    conversationId: str
+    agentType: str
+    placeId: str
+    phoneE164: str
+    slots: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CallStartResponseV2(BaseModel):
+    """Response from call start (stub in Step 3)."""
+    status: str  # "NOT_IMPLEMENTED" in Step 3
+    message: str
+
+
+# ============================================================
+# Call Start V3 Models (Step 4 - Real Twilio Calls)
+# ============================================================
+
+class CallStartRequestV3(BaseModel):
+    """Request to start a real Twilio call."""
+    conversationId: str
+    agentType: str
+    placeId: str
+    phoneE164: str
+    slots: Dict[str, Any] = Field(default_factory=dict)
+    scriptPreview: str  # The generated script to speak
+
+
+class CallStartResponseV3(BaseModel):
+    """Response with real Twilio call ID."""
+    callId: str  # Twilio Call SID
+    status: str  # "queued", "ringing", etc.
+    message: str
+
+
+class CallStatusResponseV1(BaseModel):
+    """Response from GET /call/status/{callId}."""
+    callId: str
+    status: str  # queued, ringing, in-progress, completed, failed, busy, no-answer
+    durationSeconds: Optional[int] = None
+    transcript: Optional[str] = None
+    outcome: Optional[Dict[str, Any]] = None  # OpenAI analysis
+    error: Optional[str] = None

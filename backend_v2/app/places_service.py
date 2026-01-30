@@ -9,13 +9,15 @@ Python 3.9 compatible - uses typing.Dict, typing.List, typing.Optional
 """
 
 import logging
+import math
 import os
-import re
 from typing import List, Optional, Tuple
 
 import httpx
+import phonenumbers
+from phonenumbers import NumberParseException
 
-from .models import PlaceCandidate, PlaceSearchResponse, PlaceDetailsResponse
+from .models import PlaceCandidate, PlaceSearchResponse, PlaceDetailsResponse, GeocodeResponse
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,9 @@ class GooglePlacesService:
     # Allowed radius values in km
     ALLOWED_RADII = [25, 50, 100]
 
+    # Pass number mapping: radius -> pass number
+    RADIUS_TO_PASS = {25: 1, 50: 2, 100: 3}
+
     def __init__(self):
         self.api_key = os.getenv("GOOGLE_PLACES_API_KEY")
         if not self.api_key:
@@ -43,7 +48,7 @@ class GooglePlacesService:
         await self.http_client.aclose()
         logger.info("Google Places service closed")
 
-    async def geocode_area(self, area: str, country: str) -> Optional[Tuple[float, float]]:
+    async def geocode_area(self, area: str, country: str) -> Optional[Tuple[float, float, str]]:
         """
         Geocode an area name to lat/lng coordinates.
 
@@ -52,7 +57,7 @@ class GooglePlacesService:
             country: Country code like "AU"
 
         Returns:
-            Tuple of (latitude, longitude) or None if geocoding fails
+            Tuple of (latitude, longitude, formatted_address) or None if geocoding fails
         """
         params = {
             "address": f"{area} {country}",
@@ -65,10 +70,12 @@ class GooglePlacesService:
             data = response.json()
 
             if data.get("status") == "OK" and data.get("results"):
-                location = data["results"][0]["geometry"]["location"]
+                result = data["results"][0]
+                location = result["geometry"]["location"]
                 lat, lng = location["lat"], location["lng"]
+                formatted_address = result.get("formatted_address", f"{area}, {country}")
                 logger.debug(f"Geocoded '{area} {country}' to ({lat}, {lng})")
-                return (lat, lng)
+                return (lat, lng, formatted_address)
 
             logger.warning(f"Geocoding failed for '{area} {country}': {data.get('status')}")
             return None
@@ -76,6 +83,59 @@ class GooglePlacesService:
         except Exception as e:
             logger.error(f"Geocoding error for '{area} {country}': {e}")
             return None
+
+    async def geocode(self, area: str, country: str) -> GeocodeResponse:
+        """
+        Public geocode endpoint - geocode an area name.
+
+        Args:
+            area: Area name like "Browns Plains"
+            country: Country code like "AU"
+
+        Returns:
+            GeocodeResponse with lat/lng or error
+        """
+        result = await self.geocode_area(area, country)
+        if result is None:
+            return GeocodeResponse(
+                latitude=0.0,
+                longitude=0.0,
+                formattedAddress="",
+                error=f"Could not geocode: {area}"
+            )
+
+        lat, lng, formatted_address = result
+        return GeocodeResponse(
+            latitude=lat,
+            longitude=lng,
+            formattedAddress=formatted_address,
+            error=None
+        )
+
+    @staticmethod
+    def _calculate_distance_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> int:
+        """
+        Calculate distance between two points using Haversine formula.
+
+        Args:
+            lat1, lng1: First point coordinates
+            lat2, lng2: Second point coordinates
+
+        Returns:
+            Distance in meters
+        """
+        R = 6371000  # Earth's radius in meters
+
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lng2 - lng1)
+
+        a = math.sin(delta_phi / 2) ** 2 + \
+            math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+        return int(R * c)
 
     async def text_search(
         self,
@@ -99,22 +159,27 @@ class GooglePlacesService:
         Returns:
             PlaceSearchResponse with candidates or error
         """
-        # Coerce radius to allowed values
+        # Note: radius validation is now done in route handler (returns 400)
+        # This is a fallback only
         if radius_km not in self.ALLOWED_RADII:
             logger.warning(f"Invalid radius {radius_km}km, coercing to 25km")
             radius_km = 25
+
+        # Calculate pass number from radius
+        pass_number = self.RADIUS_TO_PASS.get(radius_km, 1)
 
         # Geocode the area first to get coordinates for location bias
         coords = await self.geocode_area(area, country)
         if not coords:
             logger.warning(f"Could not geocode area '{area}', returning AREA_NOT_FOUND")
             return PlaceSearchResponse(
+                passNumber=pass_number,
                 radiusKm=radius_km,
                 candidates=[],
                 error="AREA_NOT_FOUND"
             )
 
-        lat, lng = coords
+        center_lat, center_lng, _ = coords
         radius_m = radius_km * 1000
 
         # Build the search query - include area in query string for better results
@@ -122,7 +187,7 @@ class GooglePlacesService:
 
         params = {
             "query": search_query,
-            "location": f"{lat},{lng}",
+            "location": f"{center_lat},{center_lng}",
             "radius": radius_m,
             "key": self.api_key,
         }
@@ -136,6 +201,7 @@ class GooglePlacesService:
             if status not in ["OK", "ZERO_RESULTS"]:
                 logger.error(f"Places API error: {status}")
                 return PlaceSearchResponse(
+                    passNumber=pass_number,
                     radiusKm=radius_km,
                     candidates=[],
                     error="PLACES_ERROR"
@@ -152,18 +218,31 @@ class GooglePlacesService:
                     continue
 
                 location = result.get("geometry", {}).get("location", {})
+                candidate_lat = location.get("lat")
+                candidate_lng = location.get("lng")
+
+                # Calculate distance from search center
+                distance_meters = None
+                if candidate_lat is not None and candidate_lng is not None:
+                    distance_meters = self._calculate_distance_meters(
+                        center_lat, center_lng,
+                        candidate_lat, candidate_lng
+                    )
 
                 candidate = PlaceCandidate(
                     placeId=place_id,
                     name=name,
                     formattedAddress=result.get("formatted_address"),
-                    lat=location.get("lat"),
-                    lng=location.get("lng")
+                    lat=candidate_lat,
+                    lng=candidate_lng,
+                    distanceMeters=distance_meters,
+                    hasValidPhone=False  # Unknown until details call
                 )
                 candidates.append(candidate)
 
-            logger.info(f"Text search for '{query}' near '{area}': {len(candidates)} candidates")
+            logger.info(f"Text search for '{query}' near '{area}': {len(candidates)} candidates (pass {pass_number})")
             return PlaceSearchResponse(
+                passNumber=pass_number,
                 radiusKm=radius_km,
                 candidates=candidates,
                 error=None
@@ -172,6 +251,7 @@ class GooglePlacesService:
         except Exception as e:
             logger.error(f"Text search error: {e}")
             return PlaceSearchResponse(
+                passNumber=pass_number,
                 radiusKm=radius_km,
                 candidates=[],
                 error="PLACES_ERROR"
@@ -249,15 +329,22 @@ class GooglePlacesService:
                 error="PLACES_ERROR"
             )
 
-    def _normalize_to_e164(self, phone: Optional[str]) -> Optional[str]:
+    def _normalize_to_e164(self, phone: Optional[str], default_region: str = "AU") -> Optional[str]:
         """
-        Normalize phone number to E.164 format.
+        Normalize phone number to E.164 format using phonenumbers library.
 
         E.164 format: +[country code][subscriber number]
         Example: +61412345678
 
+        Handles various input formats:
+        - "+61731824583"
+        - "07 3182 4583"
+        - "(07) 3182 4583"
+        - "0731824583"
+
         Args:
             phone: Raw phone number string
+            default_region: Default region code for parsing (default "AU")
 
         Returns:
             E.164 formatted phone or None if invalid/missing
@@ -265,30 +352,24 @@ class GooglePlacesService:
         if not phone:
             return None
 
-        # Remove spaces, hyphens, parentheses
-        cleaned = re.sub(r'[\s\-\(\)]', '', phone)
+        try:
+            # Parse the phone number with default region
+            parsed = phonenumbers.parse(phone, default_region)
 
-        # Already in E.164 format (starts with + and has enough digits)
-        if cleaned.startswith('+') and len(cleaned) >= 8:
-            # Validate it looks like a phone number
-            if re.match(r'^\+\d{7,15}$', cleaned):
-                return cleaned
+            # Validate the number
+            if not phonenumbers.is_valid_number(parsed):
+                logger.debug(f"Invalid phone number: {phone}")
+                return None
 
-        # Try to normalize Australian numbers
-        digits = re.sub(r'[^\d]', '', cleaned)
+            # Format to E.164
+            e164 = phonenumbers.format_number(
+                parsed,
+                phonenumbers.PhoneNumberFormat.E164
+            )
 
-        # Australian format: starts with 0, 10 digits total (e.g., 0412345678)
-        if digits.startswith('0') and len(digits) == 10:
-            return f"+61{digits[1:]}"
+            logger.debug(f"Normalized phone '{phone}' to '{e164}'")
+            return e164
 
-        # Australian without leading 0: 9 digits (e.g., 412345678)
-        if len(digits) == 9 and digits[0] in '234789':
-            return f"+61{digits}"
-
-        # Australian landline: 8 digits with area code implied
-        if len(digits) == 8:
-            # Could be landline without area code - can't reliably normalize
+        except NumberParseException as e:
+            logger.debug(f"Could not parse phone '{phone}': {e}")
             return None
-
-        logger.debug(f"Could not normalize phone: {phone}")
-        return None

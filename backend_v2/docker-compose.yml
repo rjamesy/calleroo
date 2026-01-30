@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: calleroo-backend-v2
+    env_file: .env
+    expose:
+      - "8000"
+    restart: unless-stopped
+    networks:
+      - calleroo-net
+
+  caddy:
+    image: caddy:2
+    container_name: calleroo-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks:
+      - calleroo-net
+    depends_on:
+      - api
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  calleroo-net:
+    driver: bridge
