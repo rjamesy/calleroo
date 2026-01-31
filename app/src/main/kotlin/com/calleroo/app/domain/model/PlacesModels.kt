@@ -25,7 +25,9 @@ data class PlaceCandidate(
     val name: String,
     val formattedAddress: String? = null,
     val lat: Double? = null,
-    val lng: Double? = null
+    val lng: Double? = null,
+    val distanceMeters: Int? = null,
+    val hasValidPhone: Boolean = false
 )
 
 /**
@@ -33,6 +35,7 @@ data class PlaceCandidate(
  */
 @Serializable
 data class PlaceSearchResponse(
+    val passNumber: Int = 1,  // 1=25km, 2=50km, 3=100km
     val radiusKm: Int,
     val candidates: List<PlaceCandidate>,
     val error: String? = null

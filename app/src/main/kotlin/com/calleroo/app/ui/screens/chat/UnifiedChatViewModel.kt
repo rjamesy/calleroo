@@ -16,7 +16,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import java.util.UUID
 import javax.inject.Inject
 
@@ -28,10 +27,15 @@ class UnifiedChatViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
+    // Navigation event for Continue button - triggers navigation to PlaceSearch
+    private val _navigateToPlaceSearch = MutableStateFlow<Pair<String, String>?>(null)
+    val navigateToPlaceSearch: StateFlow<Pair<String, String>?> = _navigateToPlaceSearch.asStateFlow()
+
     private var messageHistory: MutableList<ChatMessage> = mutableListOf()
 
     companion object {
         private const val TAG = "UnifiedChatViewModel"
+        private const val START_TOKEN = "__START__"
     }
 
     /**
@@ -46,8 +50,8 @@ class UnifiedChatViewModel @Inject constructor(
             )
         }
 
-        // Start conversation by sending empty message to get first question
-        sendMessage("")
+        // Start conversation by requesting the first assistant message (no user bubble/history)
+        sendMessage(START_TOKEN)
     }
 
     /**
@@ -57,10 +61,11 @@ class UnifiedChatViewModel @Inject constructor(
      * It ONLY posts to /conversation/next and renders the response.
      */
     fun sendMessage(userMessage: String) {
-        val currentState = _uiState.value
+        val isStart = userMessage == START_TOKEN
+        if (userMessage.isBlank() && !isStart) return
 
-        // Add user message to UI (if not empty/initial)
-        if (userMessage.isNotBlank()) {
+        // Add user message to UI/history only when not start
+        if (!isStart) {
             val userMessageUi = ChatMessageUi(
                 id = UUID.randomUUID().toString(),
                 content = userMessage,
@@ -68,7 +73,6 @@ class UnifiedChatViewModel @Inject constructor(
             )
             _uiState.update { it.copy(messages = it.messages + userMessageUi) }
 
-            // Add to history for backend
             messageHistory.add(ChatMessage(role = "user", content = userMessage))
         }
 
@@ -82,11 +86,16 @@ class UnifiedChatViewModel @Inject constructor(
         }
 
         viewModelScope.launch {
+            // Always take the latest state for the request (avoid stale snapshot)
+            val stateForRequest = _uiState.value
+
+            val outboundMessage = if (isStart) "" else userMessage
+
             val result = conversationRepository.nextTurn(
-                conversationId = currentState.conversationId,
-                agentType = currentState.agentType,
-                userMessage = userMessage,
-                slots = currentState.slots,
+                conversationId = stateForRequest.conversationId,
+                agentType = stateForRequest.agentType,
+                userMessage = outboundMessage,
+                slots = stateForRequest.slots,
                 messageHistory = messageHistory.toList(),
                 debug = true
             )
@@ -98,18 +107,17 @@ class UnifiedChatViewModel @Inject constructor(
 
                     Log.d(TAG, "Backend response: action=${response.nextAction}, aiModel=${response.aiModel}")
 
-                    // Add assistant message to UI
                     val assistantMessageUi = ChatMessageUi(
                         id = UUID.randomUUID().toString(),
                         content = response.assistantMessage,
                         isUser = false
                     )
 
-                    // Add to history for backend
                     messageHistory.add(ChatMessage(role = "assistant", content = response.assistantMessage))
 
-                    // Merge extracted data into slots
-                    val newSlots = mergeSlots(currentState.slots, response.extractedData)
+                    // Merge extracted data into the latest slots (avoid stale merge base)
+                    val latestSlots = _uiState.value.slots
+                    val newSlots = mergeSlots(latestSlots, response.extractedData)
 
                     _uiState.update {
                         it.copy(
@@ -147,19 +155,29 @@ class UnifiedChatViewModel @Inject constructor(
         sendMessage(response)
     }
 
-    /**
-     * Clear error state.
-     */
     fun clearError() {
         _uiState.update { it.copy(error = null) }
     }
 
     /**
      * Handle "Continue" button after COMPLETE.
-     * Step 1: Just logs that next screen is not implemented.
+     * Triggers navigation to PlaceSearch screen using the placeSearchParams from backend.
      */
     fun handleContinue() {
-        Log.i(TAG, "NEXT_SCREEN_NOT_IMPLEMENTED")
+        val params = _uiState.value.placeSearchParams
+        if (params != null) {
+            Log.i(TAG, "Continue clicked - navigating to PlaceSearch: query=${params.query}, area=${params.area}")
+            _navigateToPlaceSearch.value = Pair(params.query, params.area)
+        } else {
+            Log.w(TAG, "Continue clicked but no placeSearchParams available")
+        }
+    }
+
+    /**
+     * Clear navigation event after handling.
+     */
+    fun clearNavigateToPlaceSearch() {
+        _navigateToPlaceSearch.value = null
     }
 
     /**
@@ -171,20 +189,13 @@ class UnifiedChatViewModel @Inject constructor(
 
     /**
      * Merge new extracted data into existing slots.
-     * Server-side merging is authoritative, but we also track locally for display.
      */
     private fun mergeSlots(existing: JsonObject, newData: JsonObject?): JsonObject {
         if (newData == null) return existing
 
         return buildJsonObject {
-            // Copy existing slots
-            existing.forEach { (key, value) ->
-                put(key, value)
-            }
-            // Add/override with new data
-            newData.forEach { (key, value) ->
-                put(key, value)
-            }
+            existing.forEach { (key, value) -> put(key, value) }
+            newData.forEach { (key, value) -> put(key, value) }
         }
     }
 }

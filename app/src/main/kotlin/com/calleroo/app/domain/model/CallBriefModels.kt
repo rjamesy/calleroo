@@ -135,3 +135,36 @@ data class CallStatusResponseV1(
     val isTerminal: Boolean
         get() = status in listOf("completed", "failed", "busy", "no-answer", "canceled")
 }
+
+// ============================================================
+// Call Result Format Models (Post-call summary formatting)
+// ============================================================
+
+/**
+ * Request to format call results for display.
+ * Used with POST /call/result/format endpoint.
+ */
+@Serializable
+data class CallResultFormatRequestV1(
+    val agentType: String,
+    val callId: String,
+    val status: String,
+    val durationSeconds: Int? = null,
+    val transcript: String? = null,
+    val outcome: JsonObject? = null,
+    val error: String? = null
+)
+
+/**
+ * Formatted call results for UI display.
+ */
+@Serializable
+data class CallResultFormatResponseV1(
+    val title: String, // e.g. "Call completed"
+    val bullets: List<String>, // short bullet points (max 8)
+    val extractedFacts: JsonObject = JsonObject(emptyMap()), // pass-through from outcome
+    val nextSteps: List<String>, // 1-4 action items
+    val formattedTranscript: String? = null,
+    val aiCallMade: Boolean,
+    val aiModel: String
+)

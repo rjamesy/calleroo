@@ -16,11 +16,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -29,6 +31,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -36,15 +40,23 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TimePicker
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberDatePickerState
+import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -53,6 +65,11 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.calleroo.app.domain.model.AgentType
 import com.calleroo.app.ui.viewmodel.TaskSessionViewModel
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -61,10 +78,15 @@ fun CallSummaryScreen(
     onNavigateBack: () -> Unit,
     onNavigateToChat: () -> Unit,
     onNavigateToCallStatus: (String) -> Unit,
+    onNavigateToScheduledConfirmation: (String, String) -> Unit,
     viewModel: CallSummaryViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsState()
     val navigateToCallStatus by viewModel.navigateToCallStatus.collectAsState()
+    val navigateToScheduledConfirmation by viewModel.navigateToScheduledConfirmation.collectAsState()
+
+    // Snackbar for error messages
+    val snackbarHostState = remember { SnackbarHostState() }
 
     // Initialize ViewModel with task session on first composition
     LaunchedEffect(Unit) {
@@ -79,6 +101,21 @@ fun CallSummaryScreen(
         }
     }
 
+    // Handle navigation to ScheduledConfirmation screen
+    LaunchedEffect(navigateToScheduledConfirmation) {
+        navigateToScheduledConfirmation?.let { (agentType, scheduledTimeUtc) ->
+            viewModel.clearNavigateToScheduledConfirmation()
+            onNavigateToScheduledConfirmation(agentType, scheduledTimeUtc)
+        }
+    }
+
+    // Handle snackbar messages
+    LaunchedEffect(Unit) {
+        viewModel.snackbarMessage.collect { message ->
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -86,13 +123,14 @@ fun CallSummaryScreen(
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            imageVector = Icons.Filled.ArrowBack,
                             contentDescription = "Back"
                         )
                     }
                 }
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             if (state is CallSummaryState.ReadyToReview) {
                 val reviewState = state as CallSummaryState.ReadyToReview
@@ -149,7 +187,10 @@ fun CallSummaryScreen(
                         onUpdateDisclosure = viewModel::updateDisclosure,
                         onUpdateFallbacks = viewModel::updateFallbacks,
                         onEditNumber = viewModel::startEditingNumber,
-                        onNavigateToChat = onNavigateToChat
+                        onNavigateToChat = onNavigateToChat,
+                        onDateSelected = viewModel::updateScheduleDate,
+                        onTimeSelected = viewModel::updateScheduleTime,
+                        onScheduleCall = viewModel::scheduleCall
                     )
                 }
 
@@ -164,6 +205,10 @@ fun CallSummaryScreen(
 
                 is CallSummaryState.StartingCall -> {
                     LoadingContent(message = "Starting call...")
+                }
+
+                is CallSummaryState.SchedulingCall -> {
+                    LoadingContent(message = "Scheduling call...")
                 }
 
                 is CallSummaryState.Error -> {
@@ -196,6 +241,7 @@ private fun LoadingContent(message: String = "Loading call brief...") {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ReadyToReviewContent(
     state: CallSummaryState.ReadyToReview,
@@ -204,7 +250,10 @@ private fun ReadyToReviewContent(
     onUpdateDisclosure: (Boolean?, Boolean?) -> Unit,
     onUpdateFallbacks: (Boolean?, Boolean?, Boolean?, Boolean?, Boolean?) -> Unit,
     onEditNumber: () -> Unit,
-    onNavigateToChat: () -> Unit
+    onNavigateToChat: () -> Unit,
+    onDateSelected: (LocalDate?) -> Unit,
+    onTimeSelected: (LocalTime?) -> Unit,
+    onScheduleCall: () -> Unit
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -264,6 +313,20 @@ private fun ReadyToReviewContent(
                 checklist = state.checklist,
                 onToggleItem = onToggleChecklistItem
             )
+        }
+
+        // Schedule Call Card (only if scheduler is available)
+        if (state.isSchedulerAvailable) {
+            item {
+                ScheduleCallCard(
+                    selectedDate = state.scheduleDate,
+                    selectedTime = state.scheduleTime,
+                    canSchedule = state.canScheduleCall,
+                    onDateSelected = onDateSelected,
+                    onTimeSelected = onTimeSelected,
+                    onScheduleCall = onScheduleCall
+                )
+            }
         }
 
         // Bottom spacing for sticky CTA
@@ -514,6 +577,22 @@ private fun FallbackCard(
                         onCheckedChange = { onUpdateFallbacks(null, null, null, null, it) }
                     )
                 }
+
+                AgentType.SICK_CALLER -> {
+                    ToggleRow(
+                        label = "Leave voicemail",
+                        checked = fallbacks.leaveVoicemail ?: false,
+                        onCheckedChange = { onUpdateFallbacks(null, null, null, null, it) }
+                    )
+                }
+
+                AgentType.CANCEL_APPOINTMENT -> {
+                    ToggleRow(
+                        label = "Leave voicemail",
+                        checked = fallbacks.leaveVoicemail ?: false,
+                        onCheckedChange = { onUpdateFallbacks(null, null, null, null, it) }
+                    )
+                }
             }
         }
     }
@@ -672,5 +751,182 @@ private fun ErrorContent(
                 Text("Retry")
             }
         }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ScheduleCallCard(
+    selectedDate: LocalDate?,
+    selectedTime: LocalTime?,
+    canSchedule: Boolean,
+    onDateSelected: (LocalDate?) -> Unit,
+    onTimeSelected: (LocalTime?) -> Unit,
+    onScheduleCall: () -> Unit
+) {
+    var showDatePicker by remember { mutableStateOf(false) }
+    var showTimePicker by remember { mutableStateOf(false) }
+
+    val dateFormatter = remember { DateTimeFormatter.ofPattern("EEE, MMM d, yyyy") }
+    val timeFormatter = remember { DateTimeFormatter.ofPattern("h:mm a") }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Schedule,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.secondary
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Schedule for Later",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                )
+            }
+
+            Text(
+                text = "Instead of calling now, schedule this call for a specific time.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Date picker button
+                OutlinedButton(
+                    onClick = { showDatePicker = true },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DateRange,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = selectedDate?.format(dateFormatter) ?: "Select Date"
+                    )
+                }
+
+                // Time picker button
+                OutlinedButton(
+                    onClick = { showTimePicker = true },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Schedule,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = selectedTime?.format(timeFormatter) ?: "Select Time"
+                    )
+                }
+            }
+
+            Button(
+                onClick = onScheduleCall,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = canSchedule,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.secondary
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Schedule,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Schedule Call")
+            }
+        }
+    }
+
+    // Date Picker Dialog
+    if (showDatePicker) {
+        val datePickerState = rememberDatePickerState(
+            initialSelectedDateMillis = selectedDate?.atStartOfDay(ZoneId.systemDefault())
+                ?.toInstant()?.toEpochMilli()
+                ?: System.currentTimeMillis()
+        )
+
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        datePickerState.selectedDateMillis?.let { millis ->
+                            val date = Instant.ofEpochMilli(millis)
+                                .atZone(ZoneId.systemDefault())
+                                .toLocalDate()
+                            onDateSelected(date)
+                        }
+                        showDatePicker = false
+                    }
+                ) {
+                    Text("OK")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDatePicker = false }) {
+                    Text("Cancel")
+                }
+            }
+        ) {
+            DatePicker(state = datePickerState)
+        }
+    }
+
+    // Time Picker Dialog
+    if (showTimePicker) {
+        val timePickerState = rememberTimePickerState(
+            initialHour = selectedTime?.hour ?: 9,
+            initialMinute = selectedTime?.minute ?: 0
+        )
+
+        AlertDialog(
+            onDismissRequest = { showTimePicker = false },
+            title = { Text("Select Time") },
+            text = {
+                Box(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    TimePicker(state = timePickerState)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onTimeSelected(LocalTime.of(timePickerState.hour, timePickerState.minute))
+                        showTimePicker = false
+                    }
+                ) {
+                    Text("OK")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTimePicker = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }

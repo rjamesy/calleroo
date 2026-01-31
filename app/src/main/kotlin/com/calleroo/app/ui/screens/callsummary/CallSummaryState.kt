@@ -3,6 +3,8 @@ package com.calleroo.app.ui.screens.callsummary
 import com.calleroo.app.domain.model.CallBriefDisclosure
 import com.calleroo.app.domain.model.CallBriefFallbacks
 import com.calleroo.app.domain.model.ResolvedPlace
+import java.time.LocalDate
+import java.time.LocalTime
 
 /**
  * State machine for Call Summary screen (Screen 4).
@@ -37,7 +39,11 @@ sealed class CallSummaryState {
         val disclosure: CallBriefDisclosure,
         val fallbacks: CallBriefFallbacks,
         val normalizedPhoneE164: String,
-        val requiredFieldsMissing: List<String>
+        val requiredFieldsMissing: List<String>,
+        // Scheduling fields
+        val scheduleDate: LocalDate? = null,
+        val scheduleTime: LocalTime? = null,
+        val isSchedulerAvailable: Boolean = false
     ) : CallSummaryState() {
 
         /**
@@ -52,6 +58,13 @@ sealed class CallSummaryState {
          */
         val hasBlocker: Boolean
             get() = requiredFieldsMissing.isNotEmpty()
+
+        /**
+         * Check if Schedule Call button should be enabled.
+         * Requires: canStartCall AND date AND time selected.
+         */
+        val canScheduleCall: Boolean
+            get() = canStartCall && scheduleDate != null && scheduleTime != null
     }
 
     /**
@@ -67,6 +80,11 @@ sealed class CallSummaryState {
      * Starting call state (loading).
      */
     data object StartingCall : CallSummaryState()
+
+    /**
+     * Scheduling call state (loading).
+     */
+    data object SchedulingCall : CallSummaryState()
 
     /**
      * Error state with message.

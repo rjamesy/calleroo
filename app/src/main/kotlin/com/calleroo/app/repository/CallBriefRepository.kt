@@ -5,6 +5,8 @@ import com.calleroo.app.domain.model.CallBriefFallbacks
 import com.calleroo.app.domain.model.CallBriefPlace
 import com.calleroo.app.domain.model.CallBriefRequestV2
 import com.calleroo.app.domain.model.CallBriefResponseV2
+import com.calleroo.app.domain.model.CallResultFormatRequestV1
+import com.calleroo.app.domain.model.CallResultFormatResponseV1
 import com.calleroo.app.domain.model.CallStartRequestV2
 import com.calleroo.app.domain.model.CallStartResponseV2
 import com.calleroo.app.domain.model.CallStartRequestV3
@@ -150,6 +152,28 @@ class CallBriefRepository @Inject constructor(
     suspend fun getCallStatus(callId: String): Result<CallStatusResponseV1> {
         return try {
             val response = conversationApi.getCallStatus(callId)
+            Result.success(response)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ============================================================
+    // Call Result Formatting (Post-call summary)
+    // ============================================================
+
+    /**
+     * Format call results for display in the app.
+     *
+     * This endpoint uses OpenAI to generate a user-friendly summary
+     * of the call outcome with bullets and next steps.
+     *
+     * @param request The format request with call data
+     * @return Formatted response with title, bullets, facts, and next steps
+     */
+    suspend fun formatCallResult(request: CallResultFormatRequestV1): Result<CallResultFormatResponseV1> {
+        return try {
+            val response = conversationApi.formatCallResult(request)
             Result.success(response)
         } catch (e: Exception) {
             Result.failure(e)

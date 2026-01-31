@@ -2,6 +2,8 @@ package com.calleroo.app.network
 
 import com.calleroo.app.domain.model.CallBriefRequestV2
 import com.calleroo.app.domain.model.CallBriefResponseV2
+import com.calleroo.app.domain.model.CallResultFormatRequestV1
+import com.calleroo.app.domain.model.CallResultFormatResponseV1
 import com.calleroo.app.domain.model.CallStartRequestV2
 import com.calleroo.app.domain.model.CallStartResponseV2
 import com.calleroo.app.domain.model.CallStartRequestV3
@@ -41,4 +43,8 @@ interface ConversationApi {
 
     @GET("/call/status/{callId}")
     suspend fun getCallStatus(@Path("callId") callId: String): CallStatusResponseV1
+
+    // Post-call result formatting
+    @POST("/call/result/format")
+    suspend fun formatCallResult(@Body request: CallResultFormatRequestV1): CallResultFormatResponseV1
 }

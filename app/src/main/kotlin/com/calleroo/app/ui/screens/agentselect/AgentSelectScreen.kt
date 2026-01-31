@@ -19,6 +19,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Inventory
+import androidx.compose.material.icons.filled.EventBusy
+import androidx.compose.material.icons.filled.LocalHospital
 import androidx.compose.material.icons.filled.Restaurant
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -62,6 +64,18 @@ fun AgentSelectScreen(
             icon = Icons.Default.Restaurant,
             title = "Book Restaurant",
             description = "Book a table at a restaurant"
+        ),
+        AgentTile(
+            type = AgentType.SICK_CALLER,
+            icon = Icons.Default.LocalHospital,
+            title = "Call in Sick",
+            description = "Notify your workplace you're unwell"
+        ),
+        AgentTile(
+            type = AgentType.CANCEL_APPOINTMENT,
+            icon = Icons.Default.EventBusy,
+            title = "Cancel Appointment",
+            description = "Cancel an existing booking for you"
         )
     )
 

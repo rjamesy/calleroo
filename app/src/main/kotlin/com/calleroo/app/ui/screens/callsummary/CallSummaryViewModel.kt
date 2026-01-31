@@ -3,27 +3,41 @@ package com.calleroo.app.ui.screens.callsummary
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.calleroo.app.BuildConfig
 import com.calleroo.app.domain.model.AgentType
 import com.calleroo.app.domain.model.CallBriefDisclosure
 import com.calleroo.app.domain.model.CallBriefFallbacks
 import com.calleroo.app.domain.model.CallBriefPlace
+import com.calleroo.app.domain.model.CreateScheduledTaskRequest
+import com.calleroo.app.domain.model.DirectTaskPayload
 import com.calleroo.app.domain.model.ResolvedPlace
 import com.calleroo.app.repository.CallBriefRepository
+import com.calleroo.app.repository.SchedulerRepository
 import com.calleroo.app.ui.viewmodel.TaskSessionViewModel
 import com.google.i18n.phonenumbers.PhoneNumberUtil
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import javax.inject.Inject
 
 @HiltViewModel
 class CallSummaryViewModel @Inject constructor(
-    private val callBriefRepository: CallBriefRepository
+    private val callBriefRepository: CallBriefRepository,
+    private val schedulerRepository: SchedulerRepository
 ) : ViewModel() {
 
     private val _state = MutableStateFlow<CallSummaryState>(CallSummaryState.LoadingBrief)
@@ -48,15 +62,34 @@ class CallSummaryViewModel @Inject constructor(
     // Script preview for V3 call start
     private var currentScriptPreview: String = ""
 
+    // Schedule date/time (preserved across state changes)
+    private var scheduleDate: LocalDate? = null
+    private var scheduleTime: LocalTime? = null
+
     // Navigation callback for call status screen
     private val _navigateToCallStatus = MutableStateFlow<String?>(null)
     val navigateToCallStatus: StateFlow<String?> = _navigateToCallStatus.asStateFlow()
+
+    // Navigation callback for scheduled confirmation screen (agentType, scheduledTimeUtc)
+    private val _navigateToScheduledConfirmation = MutableStateFlow<Pair<String, String>?>(null)
+    val navigateToScheduledConfirmation: StateFlow<Pair<String, String>?> = _navigateToScheduledConfirmation.asStateFlow()
+
+    // Snackbar messages for errors
+    private val _snackbarMessage = MutableSharedFlow<String>()
+    val snackbarMessage: SharedFlow<String> = _snackbarMessage.asSharedFlow()
 
     /**
      * Clear navigation event after consumption.
      */
     fun clearNavigateToCallStatus() {
         _navigateToCallStatus.value = null
+    }
+
+    /**
+     * Clear scheduled confirmation navigation event after consumption.
+     */
+    fun clearNavigateToScheduledConfirmation() {
+        _navigateToScheduledConfirmation.value = null
     }
 
     companion object {
@@ -128,7 +161,10 @@ class CallSummaryViewModel @Inject constructor(
                         disclosure = currentDisclosure,
                         fallbacks = currentFallbacks,
                         normalizedPhoneE164 = response.normalizedPhoneE164,
-                        requiredFieldsMissing = response.requiredFieldsMissing
+                        requiredFieldsMissing = response.requiredFieldsMissing,
+                        scheduleDate = scheduleDate,
+                        scheduleTime = scheduleTime,
+                        isSchedulerAvailable = schedulerRepository.isAvailable
                     )
                 },
                 onFailure = { error ->
@@ -321,6 +357,107 @@ class CallSummaryViewModel @Inject constructor(
         debounceJob = viewModelScope.launch {
             delay(DEBOUNCE_MS)
             loadCallBrief()
+        }
+    }
+
+    /**
+     * Update selected schedule date.
+     */
+    fun updateScheduleDate(date: LocalDate?) {
+        scheduleDate = date
+        val currentState = _state.value
+        if (currentState is CallSummaryState.ReadyToReview) {
+            _state.value = currentState.copy(scheduleDate = date)
+        }
+    }
+
+    /**
+     * Update selected schedule time.
+     */
+    fun updateScheduleTime(time: LocalTime?) {
+        scheduleTime = time
+        val currentState = _state.value
+        if (currentState is CallSummaryState.ReadyToReview) {
+            _state.value = currentState.copy(scheduleTime = time)
+        }
+    }
+
+    /**
+     * Schedule a call for the selected date and time.
+     * On success, navigates to ScheduledConfirmationScreen.
+     */
+    fun scheduleCall() {
+        val currentState = _state.value
+        if (currentState !is CallSummaryState.ReadyToReview) return
+        if (!currentState.canScheduleCall) return
+
+        val date = scheduleDate ?: return
+        val time = scheduleTime ?: return
+        val place = currentPlace ?: return
+
+        // Combine date and time in local timezone
+        val localZone = ZoneId.systemDefault()
+        val localDateTime = ZonedDateTime.of(date, time, localZone)
+
+        // Check if scheduled time is in the past (must be at least 1 minute in future)
+        val now = ZonedDateTime.now(localZone)
+        if (localDateTime.isBefore(now.plusMinutes(1))) {
+            viewModelScope.launch {
+                _snackbarMessage.emit("Please select a time at least 1 minute in the future")
+            }
+            return
+        }
+
+        _state.value = CallSummaryState.SchedulingCall
+
+        viewModelScope.launch {
+            // Convert to UTC ISO 8601
+            val utcDateTime = localDateTime.withZoneSameInstant(ZoneOffset.UTC)
+            val runAtUtc = utcDateTime.format(DateTimeFormatter.ISO_INSTANT)
+
+            Log.i(TAG, "Scheduling call for: $runAtUtc (local: $localDateTime)")
+
+            // Ensure backend URL has trailing slash
+            val backendUrl = BuildConfig.BACKEND_BASE_URL.let { url ->
+                if (url.endsWith("/")) url else "$url/"
+            }
+
+            val request = CreateScheduledTaskRequest(
+                runAtUtc = runAtUtc,
+                backendBaseUrl = backendUrl,
+                agentType = agentType.name,
+                conversationId = conversationId,
+                mode = "DIRECT",
+                payload = DirectTaskPayload(
+                    placeId = place.placeId,
+                    phoneE164 = currentPhone,
+                    scriptPreview = currentScriptPreview,
+                    slots = slots
+                ),
+                timezone = localZone.id
+            )
+
+            val result = schedulerRepository.createTask(request)
+
+            result.fold(
+                onSuccess = { response ->
+                    Log.i(TAG, "Call scheduled: taskId=${response.taskId}, status=${response.status}")
+
+                    // Navigate to ScheduledConfirmation screen
+                    _navigateToScheduledConfirmation.value = Pair(agentType.name, runAtUtc)
+                },
+                onFailure = { error ->
+                    Log.e(TAG, "Failed to schedule call", error)
+
+                    // Show error in snackbar, stay on screen for retry
+                    viewModelScope.launch {
+                        _snackbarMessage.emit(error.message ?: "Failed to schedule call")
+                    }
+
+                    // Return to ReadyToReview state
+                    loadCallBrief()
+                }
+            )
         }
     }
 }

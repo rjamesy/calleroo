@@ -41,10 +41,30 @@ sealed class NavRoutes(val route: String) {
 
     /**
      * Screen 5: Call Status - monitor active call and show results.
+     * Now includes agentType for navigation to CallResults.
      */
-    data object CallStatus : NavRoutes("call_status/{callId}") {
-        fun createRoute(callId: String): String {
-            return "call_status/$callId"
+    data object CallStatus : NavRoutes("call_status/{callId}/{agentType}") {
+        fun createRoute(callId: String, agentType: String): String {
+            return "call_status/$callId/$agentType"
+        }
+    }
+
+    /**
+     * Screen 6: Call Results - display formatted call results after terminal status.
+     */
+    data object CallResults : NavRoutes("call_results/{callId}/{agentType}") {
+        fun createRoute(callId: String, agentType: String): String {
+            return "call_results/$callId/$agentType"
+        }
+    }
+
+    /**
+     * Screen: Scheduled Confirmation - shows details after successfully scheduling a call.
+     */
+    data object ScheduledConfirmation : NavRoutes("scheduled_confirmation/{agentType}/{scheduledTimeUtc}") {
+        fun createRoute(agentType: String, scheduledTimeUtc: String): String {
+            val encodedTime = URLEncoder.encode(scheduledTimeUtc, StandardCharsets.UTF_8.toString())
+            return "scheduled_confirmation/$agentType/$encodedTime"
         }
     }
 }

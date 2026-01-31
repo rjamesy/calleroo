@@ -40,8 +40,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -54,97 +54,50 @@ import androidx.hilt.navigation.compose.hiltViewModel
 @Composable
 fun CallStatusScreen(
     onNavigateToHome: () -> Unit,
+    onNavigateToResults: (callId: String, agentType: String) -> Unit = { _, _ -> },
     viewModel: CallStatusViewModel = hiltViewModel()
 ) {
-    val state by viewModel.state.collectAsState()
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val navigateToResults by viewModel.navigateToResults.collectAsStateWithLifecycle()
 
+    // Navigate to results when terminal status is reached
+    androidx.compose.runtime.LaunchedEffect(navigateToResults) {
+        navigateToResults?.let { (callId, agentType) ->
+            onNavigateToResults(callId, agentType)
+            viewModel.onNavigatedToResults()
+        }
+    }
+
+    // CallStatusScreen only shows polling state - terminal states navigate to CallResults
     Scaffold(
         topBar = {
             TopAppBar(
-                title = {
-                    Text(
-                        text = when (state) {
-                            is CallStatusState.Polling -> "Call In Progress"
-                            is CallStatusState.Completed -> "Call Completed"
-                            is CallStatusState.Failed -> "Call Failed"
-                        }
-                    )
-                }
+                title = { Text("Call In Progress") }
             )
-        },
-        bottomBar = {
-            when (state) {
-                is CallStatusState.Completed -> {
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        tonalElevation = 3.dp,
-                        shadowElevation = 8.dp
-                    ) {
-                        Button(
-                            onClick = onNavigateToHome,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp)
-                        ) {
-                            Text("Done")
-                        }
-                    }
-                }
-
-                is CallStatusState.Failed -> {
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        tonalElevation = 3.dp,
-                        shadowElevation = 8.dp
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            OutlinedButton(
-                                onClick = onNavigateToHome,
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("Back to Home")
-                            }
-                            Button(
-                                onClick = { viewModel.retry() },
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Refresh,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Retry")
-                            }
-                        }
-                    }
-                }
-
-                else -> { /* No bottom bar during polling */ }
-            }
         }
+        // No bottom bar during polling
     ) { paddingValues ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
+            // Always show polling content - terminal states navigate away
             when (val currentState = state) {
                 is CallStatusState.Polling -> {
                     PollingContent(state = currentState)
                 }
-
-                is CallStatusState.Completed -> {
-                    CompletedContent(state = currentState)
-                }
-
-                is CallStatusState.Failed -> {
-                    FailedContent(state = currentState)
+                // Completed and Failed states won't be displayed - we navigate to CallResults
+                else -> {
+                    PollingContent(state = CallStatusState.Polling(
+                        callId = when (currentState) {
+                            is CallStatusState.Completed -> currentState.callId
+                            is CallStatusState.Failed -> currentState.callId
+                            is CallStatusState.Polling -> currentState.callId
+                        },
+                        status = "processing",
+                        pollCount = 0
+                    ))
                 }
             }
         }

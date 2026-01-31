@@ -22,8 +22,11 @@ android {
             useSupportLibrary = true
         }
 
-        // Backend URL - configurable for local dev
-        buildConfigField("String", "BACKEND_BASE_URL", "\"http://10.0.2.2:8000\"")
+        // Backend URL - Production API with Let's Encrypt TLS
+        buildConfigField("String", "BACKEND_BASE_URL", "\"https://api.callerooapp.com\"")
+
+        // Scheduler URL - Empty string disables scheduling feature
+        buildConfigField("String", "SCHEDULER_BASE_URL", "\"\"")
     }
 
     buildTypes {
@@ -99,6 +102,9 @@ dependencies {
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.0")
     implementation("com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter:1.0.0")
+
+    // Phone number validation (for manual entry)
+    implementation("com.googlecode.libphonenumber:libphonenumber:8.13.47")
 
     // Testing
     testImplementation("junit:junit:4.13.2")

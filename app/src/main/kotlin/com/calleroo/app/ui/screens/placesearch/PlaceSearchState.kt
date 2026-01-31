@@ -24,6 +24,7 @@ sealed class PlaceSearchState {
      * Loading state while searching for places.
      */
     data class Loading(
+        val passNumber: Int = 1,
         val radiusKm: Int = 25,
         val message: String = "Searching..."
     ) : PlaceSearchState()
@@ -32,6 +33,7 @@ sealed class PlaceSearchState {
      * Results state with place candidates.
      */
     data class Results(
+        val passNumber: Int,
         val radiusKm: Int,
         val candidates: List<PlaceCandidate>,
         val selectedPlaceId: String? = null,
@@ -49,16 +51,21 @@ sealed class PlaceSearchState {
      * No results found at current radius.
      */
     data class NoResults(
+        val passNumber: Int,
         val radiusKm: Int,
         val canExpand: Boolean,
         val error: String? = null
     ) : PlaceSearchState()
 
     /**
-     * Error state.
+     * Error state with context for retry/manual entry.
      */
     data class Error(
-        val message: String
+        val message: String,
+        val query: String = "",
+        val area: String = "",
+        val passNumber: Int = 1,
+        val radiusKm: Int = 25
     ) : PlaceSearchState()
 
     /**

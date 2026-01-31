@@ -25,10 +25,18 @@ class CallStatusViewModel @Inject constructor(
         "callId is required"
     }
 
+    private val agentType: String = checkNotNull(savedStateHandle["agentType"]) {
+        "agentType is required"
+    }
+
     private val _state = MutableStateFlow<CallStatusState>(
         CallStatusState.Polling(callId = callId)
     )
     val state: StateFlow<CallStatusState> = _state.asStateFlow()
+
+    // Navigation signal for when call reaches terminal status
+    private val _navigateToResults = MutableStateFlow<Pair<String, String>?>(null)
+    val navigateToResults: StateFlow<Pair<String, String>?> = _navigateToResults.asStateFlow()
 
     private var pollingJob: Job? = null
 
@@ -40,6 +48,13 @@ class CallStatusViewModel @Inject constructor(
 
     init {
         startPolling()
+    }
+
+    /**
+     * Called after navigation to results has occurred.
+     */
+    fun onNavigatedToResults() {
+        _navigateToResults.value = null
     }
 
     /**
@@ -60,34 +75,20 @@ class CallStatusViewModel @Inject constructor(
                     onSuccess = { response ->
                         Log.d(TAG, "Call status: ${response.status}, duration=${response.durationSeconds}")
 
-                        // Update state based on response
-                        when {
-                            response.status == "completed" -> {
-                                _state.value = CallStatusState.Completed(
-                                    callId = response.callId,
-                                    durationSeconds = response.durationSeconds ?: 0,
-                                    transcript = response.transcript,
-                                    outcome = CallOutcome.fromJson(response.outcome)
-                                )
-                                return@launch  // Stop polling
-                            }
-                            response.isTerminal -> {
-                                _state.value = CallStatusState.Failed(
-                                    callId = response.callId,
-                                    status = response.status,
-                                    error = response.error
-                                )
-                                return@launch  // Stop polling
-                            }
-                            else -> {
-                                // Update polling state
-                                _state.value = CallStatusState.Polling(
-                                    callId = response.callId,
-                                    status = response.status,
-                                    pollCount = pollCount
-                                )
-                            }
+                        // Check if call reached terminal status
+                        if (response.isTerminal) {
+                            Log.d(TAG, "Call reached terminal status: ${response.status}")
+                            // Signal navigation to CallResults screen
+                            _navigateToResults.value = Pair(callId, agentType)
+                            return@launch  // Stop polling
                         }
+
+                        // Still in progress - update polling state
+                        _state.value = CallStatusState.Polling(
+                            callId = response.callId,
+                            status = response.status,
+                            pollCount = pollCount
+                        )
                     },
                     onFailure = { error ->
                         Log.e(TAG, "Failed to get call status", error)
@@ -104,13 +105,9 @@ class CallStatusViewModel @Inject constructor(
                 delay(POLL_INTERVAL_MS)
             }
 
-            // Timeout - exceeded max polls
+            // Timeout - exceeded max polls, navigate to results anyway
             Log.w(TAG, "Polling timeout exceeded for call $callId")
-            _state.value = CallStatusState.Failed(
-                callId = callId,
-                status = "timeout",
-                error = "Call status check timed out"
-            )
+            _navigateToResults.value = Pair(callId, agentType)
         }
     }
 

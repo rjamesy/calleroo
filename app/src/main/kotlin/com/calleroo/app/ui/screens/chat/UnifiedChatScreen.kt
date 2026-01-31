@@ -70,6 +70,7 @@ import com.calleroo.app.domain.model.ConfirmationCard
 import com.calleroo.app.domain.model.InputType
 import com.calleroo.app.domain.model.NextAction
 import com.calleroo.app.domain.model.Question
+import com.calleroo.app.ui.viewmodel.TaskSessionViewModel
 import com.calleroo.app.util.UnifiedConversationGuard
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -77,17 +78,26 @@ import com.calleroo.app.util.UnifiedConversationGuard
 fun UnifiedChatScreen(
     agentType: AgentType,
     conversationId: String,
+    taskSession: TaskSessionViewModel,
     onNavigateBack: () -> Unit,
     onNavigateToPlaceSearch: (query: String, area: String) -> Unit,
     viewModel: UnifiedChatViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val navigateToPlaceSearch by viewModel.navigateToPlaceSearch.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val listState = rememberLazyListState()
 
     // Initialize on first composition
     LaunchedEffect(conversationId) {
+        // Initialize task session with conversation params
+        taskSession.initSession(conversationId, agentType)
         viewModel.initialize(agentType, conversationId)
+    }
+
+    // Update task session slots whenever they change
+    LaunchedEffect(uiState.slots) {
+        taskSession.updateSlots(uiState.slots)
     }
 
     // Auto-scroll to bottom when new messages arrive
@@ -111,6 +121,14 @@ fun UnifiedChatScreen(
             val params = uiState.placeSearchParams!!
             viewModel.clearPlaceSearchParams()
             onNavigateToPlaceSearch(params.query, params.area)
+        }
+    }
+
+    // Navigate to Place Search when Continue button is clicked
+    LaunchedEffect(navigateToPlaceSearch) {
+        navigateToPlaceSearch?.let { (query, area) ->
+            viewModel.clearNavigateToPlaceSearch()
+            onNavigateToPlaceSearch(query, area)
         }
     }
 
