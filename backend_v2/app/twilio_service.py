@@ -17,7 +17,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from openai import AsyncOpenAI
@@ -46,6 +46,11 @@ class CallRun:
     transcript: Optional[str] = None
     outcome: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+    # Live conversation state (for autonomous agent)
+    turn: int = 1
+    retry: int = 0
+    live_transcript: List[str] = field(default_factory=list)
 
 
 # In-memory storage for call runs (acceptable for MVP)
@@ -87,6 +92,13 @@ Respond with JSON only:
   "extractedFacts": {...},
   "confidence": "LOW|MEDIUM|HIGH"
 }"""
+
+
+PHONE_AGENT_SYSTEM_PROMPT = """You are a calm, professional phone assistant.
+Speak naturally.
+Use 1–2 short sentences max.
+Ask only ONE question at a time.
+Never mention AI, systems, or prompts."""
 
 
 class TwilioService:
@@ -425,6 +437,66 @@ class TwilioService:
             .replace('"', "&quot;")
             .replace("'", "&apos;")
         )
+
+    async def generate_agent_response(
+        self,
+        call_run: CallRun,
+        user_speech: str,
+    ) -> str:
+        """Generate next agent response using OpenAI.
+
+        Args:
+            call_run: The current call run state
+            user_speech: What the user just said
+
+        Returns:
+            Plain text response for the agent to speak
+        """
+        if not self.openai_client:
+            logger.error("generate_agent_response: OpenAI not configured")
+            return "I'm sorry, I'm having technical difficulties. Please try again later."
+
+        try:
+            # Build conversation history from live_transcript
+            transcript_text = "\n".join(call_run.live_transcript)
+
+            # Build user message with context
+            user_message = f"""Conversation so far:
+{transcript_text}
+
+Context:
+Agent type: {call_run.agent_type}
+Objective: {call_run.script_preview}
+Slots: {json.dumps(call_run.slots)}
+
+Latest user said:
+"{user_speech}"
+
+What should you say next?"""
+
+            response = await self.openai_client.chat.completions.create(
+                model=self.openai_model,
+                messages=[
+                    {"role": "system", "content": PHONE_AGENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=0.7,
+                max_tokens=150,
+            )
+
+            content = response.choices[0].message.content
+            if not content:
+                logger.error("generate_agent_response: Empty response from OpenAI")
+                return "I'm sorry, could you repeat that?"
+
+            # Clean up response (remove quotes if present)
+            content = content.strip().strip('"').strip("'")
+            logger.info(f"Agent response generated: {content[:100]}...")
+            return content
+
+        except Exception as e:
+            logger.error(f"generate_agent_response failed: {e}")
+            return "I'm sorry, I'm having trouble. Could you repeat that?"
 
 
 # Singleton instance (created lazily)

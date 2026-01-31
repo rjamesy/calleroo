@@ -626,10 +626,8 @@ async def twilio_voice(conversationId: str = Query(...)):
     """
     Twilio voice webhook - called when call connects.
 
-    Returns TwiML with the script to speak.
-
-    Args:
-        conversationId: Conversation ID from query param
+    Starts the conversation and waits for the callee to speak.
+    Initializes live conversation state for autonomous agent.
     """
     logger.info(f"Twilio voice webhook: conversationId={conversationId}")
 
@@ -641,17 +639,180 @@ async def twilio_voice(conversationId: str = Query(...)):
             break
 
     if call_run:
-        script = call_run.script_preview
+        opening_line = "Hello, this is Calleroo. Are you able to help me with a quick question?"
+        # Initialize live conversation state
+        call_run.turn = 1
+        call_run.retry = 0
+        call_run.live_transcript = [f"Assistant: {opening_line}"]
     else:
-        script = "Hello, this is Calleroo. I apologize, but there was a technical issue. Please have a nice day."
-        logger.warning(f"No call run found for conversation {conversationId}")
+        opening_line = "Hello, this is Calleroo. I'm sorry, something went wrong."
 
-    # Build TwiML with Australian English voice
+    webhook_base = os.getenv('WEBHOOK_BASE_URL')
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Matthew" language="en-AU">{_escape_xml(script)}</Say>
-    <Pause length="2"/>
-    <Say voice="Polly.Matthew" language="en-AU">Thank you for your time. Goodbye.</Say>
+    <Gather
+        input="speech"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=1&amp;retry=0"
+        method="POST"
+        timeout="6"
+        speechTimeout="auto"
+        language="en-AU">
+
+        <Say voice="Polly.Matthew" language="en-AU">
+            {_escape_xml(opening_line)}
+        </Say>
+
+    </Gather>
+
+    <Say voice="Polly.Matthew" language="en-AU">
+        Sorry, I didn't hear anything.
+    </Say>
+    <Redirect method="POST">
+        {webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn=1&amp;retry=1
+    </Redirect>
+</Response>"""
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/twilio/gather")
+async def twilio_gather(
+    conversationId: str = Query(...),
+    turn: int = Query(1),
+    retry: int = Query(0),
+    SpeechResult: str = Form(""),
+):
+    """
+    Twilio gather webhook - processes speech input and generates next response.
+
+    This endpoint drives the turn-by-turn autonomous conversation:
+    1. Receives user speech (or silence)
+    2. Updates live transcript
+    3. Calls OpenAI to generate next response
+    4. Returns TwiML with response and next Gather
+
+    Handles:
+    - Silence: retry up to 2 times, then hang up
+    - Turn limit: after 8 turns, end call politely
+    - Normal conversation: AI-driven responses
+    """
+    logger.info(f"Twilio gather: conversationId={conversationId}, turn={turn}, retry={retry}, speech='{SpeechResult[:50] if SpeechResult else ''}'")
+
+    webhook_base = os.getenv('WEBHOOK_BASE_URL')
+
+    # Find the call run by conversation_id
+    call_run = None
+    for run in CALL_RUNS.values():
+        if run.conversation_id == conversationId:
+            call_run = run
+            break
+
+    if not call_run:
+        logger.error(f"twilio_gather: No call run found for conversation {conversationId}")
+        twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Matthew" language="en-AU">I'm sorry, something went wrong. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Update call_run state
+    call_run.turn = turn
+    call_run.retry = retry
+
+    # Handle silence (empty SpeechResult)
+    if not SpeechResult or not SpeechResult.strip():
+        new_retry = retry + 1
+        logger.info(f"Silence detected, retry={new_retry}")
+
+        if new_retry >= 2:
+            # Too many silences, hang up
+            logger.info(f"Max retries reached, hanging up")
+            twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Matthew" language="en-AU">I haven't heard anything. Thanks for your time. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+            return Response(content=twiml, media_type="application/xml")
+
+        # Re-prompt
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather
+        input="speech"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={turn}&amp;retry={new_retry}"
+        method="POST"
+        timeout="6"
+        speechTimeout="auto"
+        language="en-AU">
+
+        <Say voice="Polly.Matthew" language="en-AU">
+            I'm sorry, I didn't catch that. Could you please repeat?
+        </Say>
+
+    </Gather>
+
+    <Say voice="Polly.Matthew" language="en-AU">
+        I still can't hear you. Thanks for your time. Goodbye.
+    </Say>
+    <Hangup/>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Check turn limit
+    if turn >= 8:
+        logger.info(f"Turn limit reached ({turn}), ending call")
+        twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Matthew" language="en-AU">Thank you so much for your help. I have all the information I need. Have a great day. Goodbye.</Say>
+    <Hangup/>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # Normal turn - process user speech
+    user_speech = SpeechResult.strip()
+
+    # Update live transcript with user speech
+    call_run.live_transcript.append(f"User: {user_speech}")
+
+    # Generate AI response
+    if twilio_service is not None:
+        agent_response = await twilio_service.generate_agent_response(call_run, user_speech)
+    else:
+        agent_response = "I'm sorry, I'm having technical difficulties. Thank you for your time. Goodbye."
+        logger.error("twilio_gather: twilio_service is None")
+
+    # Update live transcript with agent response
+    call_run.live_transcript.append(f"Assistant: {agent_response}")
+
+    # Update turn for next iteration
+    next_turn = turn + 1
+    call_run.turn = next_turn
+    call_run.retry = 0
+
+    # Build TwiML response
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Gather
+        input="speech"
+        action="{webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={next_turn}&amp;retry=0"
+        method="POST"
+        timeout="6"
+        speechTimeout="auto"
+        language="en-AU">
+
+        <Say voice="Polly.Matthew" language="en-AU">
+            {_escape_xml(agent_response)}
+        </Say>
+
+    </Gather>
+
+    <Say voice="Polly.Matthew" language="en-AU">
+        I didn't hear anything.
+    </Say>
+    <Redirect method="POST">
+        {webhook_base}/twilio/gather?conversationId={conversationId}&amp;turn={next_turn}&amp;retry=1
+    </Redirect>
 </Response>"""
 
     return Response(content=twiml, media_type="application/xml")
