@@ -1,3 +1,8 @@
+# Elastic IP: Redirect HTTP to canonical domain (never attempt HTTPS on IP)
+http://54.206.128.36 {
+    redir https://api.callerooapp.com{uri} 308
+}
+
 api.callerooapp.com {
     encode gzip
     reverse_proxy api:8000

@@ -31,6 +31,7 @@ class InputType(str, Enum):
     BOOLEAN = "BOOLEAN"
     CHOICE = "CHOICE"
     PHONE = "PHONE"
+    YES_NO = "YES_NO"  # Added for generic yes/no questions
 
 
 class Confidence(str, Enum):
@@ -49,11 +50,18 @@ class Choice(BaseModel):
     value: str
 
 
+class QuickReply(BaseModel):
+    """Universal quick reply for UI chips (replaces choices for consistency)."""
+    label: str
+    value: str
+
+
 class Question(BaseModel):
     text: str
     field: str
     inputType: InputType
-    choices: Optional[List[Choice]] = None
+    choices: Optional[List[Choice]] = None  # Legacy: kept for compatibility
+    quickReplies: Optional[List[QuickReply]] = None  # New: unified UI chips
     optional: bool = False
 
 
@@ -82,6 +90,8 @@ class ConversationRequest(BaseModel):
     clientAction: Optional[ClientAction] = None
     # Idempotency key to prevent duplicate actions (e.g., double-tap confirm)
     idempotencyKey: Optional[str] = None
+    # Current question slot name (for targeted extraction)
+    currentQuestionSlotName: Optional[str] = None
 
 
 class PlaceSearchParams(BaseModel):
@@ -89,6 +99,24 @@ class PlaceSearchParams(BaseModel):
     query: str
     area: str
     country: str = "AU"
+
+
+class AgentMeta(BaseModel):
+    """Agent metadata for generic UI handling."""
+    phoneSource: str  # "PLACE" or "DIRECT_SLOT"
+    directPhoneSlot: Optional[str] = None  # Slot name if phoneSource == "DIRECT_SLOT"
+    title: str
+    description: str
+
+
+class DebugPayload(BaseModel):
+    """Debug information returned when debug=true."""
+    planner_action: str
+    planner_question_slot: Optional[str] = None
+    extraction_llm_used: bool
+    extraction_raw_data: Optional[Dict[str, Any]] = None
+    merged_slots: Dict[str, Any]
+    missing_required_slots: List[str]
 
 
 class ConversationResponse(BaseModel):
@@ -99,8 +127,11 @@ class ConversationResponse(BaseModel):
     confidence: Confidence = Confidence.MEDIUM
     confirmationCard: Optional[ConfirmationCard] = None
     placeSearchParams: Optional[PlaceSearchParams] = None
+    agentMeta: Optional[AgentMeta] = None  # Agent metadata for generic UI
     aiCallMade: bool
     aiModel: str
+    engineVersion: str = "v1"  # "v1" or "v2" - helps debug mixed traffic
+    debugPayload: Optional[DebugPayload] = None  # Only present when debug=true
 
 
 # ============================================================

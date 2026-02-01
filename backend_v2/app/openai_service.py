@@ -1,6 +1,15 @@
 """
 OpenAI service for conversation management.
-This is the SOLE authority for conversation flow.
+
+DEPRECATED: This service is used by the legacy /conversation/next endpoint.
+The new /v2/conversation/next endpoint uses:
+- AgentSpec registry (agents/specs.py) for slot definitions
+- Deterministic planner (engine/planner.py) for flow control
+- LLM only for slot extraction (engine/extract.py), not flow decisions
+
+This service is preserved for:
+- Kill switch fallback (CONVERSATION_ENGINE_KILL_SWITCH=true)
+- Backwards compatibility during migration
 
 RESILIENCE DESIGN:
 - NEVER returns 500 due to model output

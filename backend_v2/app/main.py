@@ -151,6 +151,20 @@ async def lifespan(app: FastAPI):
     google_key = os.getenv("GOOGLE_PLACES_API_KEY")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+    # Engine version for routing (v2 is new default for staging, v1 for prod rollback)
+    engine_version = os.getenv("CONVERSATION_ENGINE_VERSION", "v2")
+
+    # Kill switch: if set to "true", forces all traffic to v1 (instant rollback)
+    kill_switch = os.getenv("CONVERSATION_ENGINE_KILL_SWITCH", "false").lower() == "true"
+
+    # Log startup configuration prominently
+    logger.info("=" * 40)
+    logger.info(f"[STARTUP] Conversation engine: {engine_version}")
+    logger.info(f"[STARTUP] Kill switch active: {kill_switch}")
+    if kill_switch:
+        logger.warning("[STARTUP] KILL SWITCH IS ON - All /v2 traffic routed to v1!")
+    logger.info("=" * 40)
+
     logger.info(f"OPENAI_API_KEY present: {bool(openai_key)} ({_mask_key(openai_key)})")
     logger.info(f"GOOGLE_PLACES_API_KEY present: {bool(google_key)} ({_mask_key(google_key)})")
     logger.info(f"OPENAI_MODEL: {openai_model}")
@@ -525,6 +539,12 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
     """
     Process the next turn in a conversation.
 
+    DEPRECATED: This endpoint uses the legacy OpenAI-driven flow.
+    New code should use /v2/conversation/next which uses AgentSpec + deterministic planner.
+    This endpoint is preserved for:
+    - Kill switch fallback (CONVERSATION_ENGINE_KILL_SWITCH=true)
+    - Backwards compatibility during migration
+
     Flow:
     1. If clientAction is CONFIRM/REJECT, handle deterministically (bypass OpenAI)
     2. Otherwise, ALWAYS call OpenAI
@@ -706,6 +726,53 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
             request.slots,
             request.conversationId,
         )
+
+
+# ============================================================
+# V2 Conversation Endpoint (AgentSpec + Deterministic Planner)
+# ============================================================
+
+from .conversation_v2 import process_conversation_v2
+
+
+@app.post("/v2/conversation/next", response_model=ConversationResponse)
+async def conversation_next_v2(request: ConversationRequest) -> ConversationResponse:
+    """
+    Process the next turn in a conversation using the new engine.
+
+    V2 DIFFERENCES:
+    - Uses AgentSpec registry (no per-agent if/else branching)
+    - Uses deterministic planner (LLM is only a parser, never decides flow)
+    - Returns quickReplies for universal UI chips
+    - Returns agentMeta for generic client-side phone routing
+
+    Flow:
+    1. If clientAction is CONFIRM/REJECT, handle deterministically
+    2. Otherwise:
+       a. Extract slots from user message (deterministic first, LLM fallback)
+       b. Merge extracted with existing slots
+       c. Run deterministic planner to decide next action
+    3. Return response with full merged slots and agentMeta
+
+    GUARANTEE: This endpoint NEVER returns HTTP 500 due to model output.
+
+    KILL SWITCH: If CONVERSATION_ENGINE_KILL_SWITCH=true, routes to v1 endpoint.
+    """
+    # Kill switch check - instant rollback to v1
+    kill_switch = os.getenv("CONVERSATION_ENGINE_KILL_SWITCH", "false").lower() == "true"
+    if kill_switch:
+        logger.info(f"[KILL_SWITCH] Routing /v2 request to v1 for conversationId={request.conversationId}")
+        return await conversation_next(request)
+
+    # Use the OpenAI client for extraction if needed
+    openai_client = openai_service.client if openai_service else None
+    model = openai_service.model if openai_service else "gpt-4o-mini"
+
+    return await process_conversation_v2(
+        request=request,
+        openai_client=openai_client,
+        model=model,
+    )
 
 
 # ============================================================
