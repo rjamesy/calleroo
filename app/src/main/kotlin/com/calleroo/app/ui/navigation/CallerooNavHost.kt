@@ -82,6 +82,12 @@ fun CallerooNavHost() {
                         navController.navigate(
                             NavRoutes.PlaceSearch.createRoute(query, area)
                         )
+                    },
+                    onNavigateToCallSummary = {
+                        // For COMPLETE without place search (e.g., SICK_CALLER with known phone)
+                        // Navigate directly to CallSummary
+                        Log.i(TAG, "Navigating to CallSummary from Chat (COMPLETE without PlaceSearch)")
+                        navController.navigate(NavRoutes.CallSummary.route)
                     }
                 )
             }

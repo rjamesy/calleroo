@@ -71,8 +71,11 @@ import com.calleroo.app.domain.model.ConfirmationCard
 import com.calleroo.app.domain.model.InputType
 import com.calleroo.app.domain.model.NextAction
 import com.calleroo.app.domain.model.Question
+import com.calleroo.app.domain.model.ResolvedPlace
 import com.calleroo.app.ui.viewmodel.TaskSessionViewModel
+import com.calleroo.app.util.PhoneUtils
 import com.calleroo.app.util.UnifiedConversationGuard
+import kotlinx.serialization.json.jsonPrimitive
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -82,10 +85,12 @@ fun UnifiedChatScreen(
     taskSession: TaskSessionViewModel,
     onNavigateBack: () -> Unit,
     onNavigateToPlaceSearch: (query: String, area: String) -> Unit,
+    onNavigateToCallSummary: () -> Unit,
     viewModel: UnifiedChatViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val navigateToPlaceSearch by viewModel.navigateToPlaceSearch.collectAsStateWithLifecycle()
+    val navigateToCallSummary by viewModel.navigateToCallSummary.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val listState = rememberLazyListState()
 
@@ -130,11 +135,54 @@ fun UnifiedChatScreen(
         }
     }
 
-    // Navigate to Place Search when Continue button is clicked
+    // Navigate to Place Search when Continue button is clicked (for FIND_PLACE)
     LaunchedEffect(navigateToPlaceSearch) {
         navigateToPlaceSearch?.let { (query, area) ->
             viewModel.clearNavigateToPlaceSearch()
             onNavigateToPlaceSearch(query, area)
+        }
+    }
+
+    // Navigate to Call Summary when Continue button is clicked (for COMPLETE)
+    // For direct-phone agents (SICK_CALLER), synthesize ResolvedPlace from slots
+    LaunchedEffect(navigateToCallSummary) {
+        if (navigateToCallSummary) {
+            viewModel.clearNavigateToCallSummary()
+
+            // For SICK_CALLER (and other direct-phone agents), we need to synthesize
+            // a ResolvedPlace from the slots since there's no PlaceSearch step
+            if (agentType == AgentType.SICK_CALLER) {
+                val slots = uiState.slots
+
+                // Extract employer_name and employer_phone from slots
+                val employerName = slots["employer_name"]?.jsonPrimitive?.content
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "Work"
+                val rawPhone = slots["employer_phone"]?.jsonPrimitive?.content ?: ""
+
+                // Convert phone to E.164 format
+                val phoneE164 = PhoneUtils.toE164(rawPhone)
+
+                if (phoneE164 != null) {
+                    // Synthesize ResolvedPlace for CallSummary
+                    val manualPlace = ResolvedPlace(
+                        placeId = "manual:sick_caller:${conversationId}",
+                        businessName = employerName,
+                        formattedAddress = null,
+                        phoneE164 = phoneE164
+                    )
+                    taskSession.setResolvedPlace(manualPlace)
+                    onNavigateToCallSummary()
+                } else {
+                    // Phone parsing failed - show error and stay on chat
+                    snackbarHostState.showSnackbar(
+                        "Invalid phone number. Please check the employer phone and try again."
+                    )
+                }
+            } else {
+                // For other agents, just navigate (CallSummary will handle missing place)
+                onNavigateToCallSummary()
+            }
         }
     }
 

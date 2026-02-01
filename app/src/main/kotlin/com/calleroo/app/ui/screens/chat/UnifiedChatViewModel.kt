@@ -33,6 +33,10 @@ class UnifiedChatViewModel @Inject constructor(
     private val _navigateToPlaceSearch = MutableStateFlow<Pair<String, String>?>(null)
     val navigateToPlaceSearch: StateFlow<Pair<String, String>?> = _navigateToPlaceSearch.asStateFlow()
 
+    // Navigation event for COMPLETE action - triggers navigation to CallSummary
+    private val _navigateToCallSummary = MutableStateFlow(false)
+    val navigateToCallSummary: StateFlow<Boolean> = _navigateToCallSummary.asStateFlow()
+
     private var messageHistory: MutableList<ChatMessage> = mutableListOf()
 
     companion object {
@@ -267,16 +271,30 @@ class UnifiedChatViewModel @Inject constructor(
     }
 
     /**
-     * Handle "Continue" button after COMPLETE.
-     * Triggers navigation to PlaceSearch screen using the placeSearchParams from backend.
+     * Handle "Continue" button click.
+     * Routes to the appropriate screen based on nextAction:
+     * - FIND_PLACE: Navigate to PlaceSearch (requires placeSearchParams)
+     * - COMPLETE: Navigate to CallSummary (for agents without place search, e.g., SICK_CALLER)
      */
     fun handleContinue() {
-        val params = _uiState.value.placeSearchParams
-        if (params != null) {
-            Log.i(TAG, "Continue clicked - navigating to PlaceSearch: query=${params.query}, area=${params.area}")
-            _navigateToPlaceSearch.value = Pair(params.query, params.area)
-        } else {
-            Log.w(TAG, "Continue clicked but no placeSearchParams available")
+        val state = _uiState.value
+        when (state.nextAction) {
+            NextAction.FIND_PLACE -> {
+                val params = state.placeSearchParams
+                if (params != null) {
+                    Log.i(TAG, "Continue -> PlaceSearch: query=${params.query}, area=${params.area}")
+                    _navigateToPlaceSearch.value = Pair(params.query, params.area)
+                } else {
+                    Log.w(TAG, "Continue clicked but nextAction=FIND_PLACE and placeSearchParams is null")
+                }
+            }
+            NextAction.COMPLETE -> {
+                Log.i(TAG, "Continue -> CallSummary: conversationId=${state.conversationId}, agentType=${state.agentType}")
+                _navigateToCallSummary.value = true
+            }
+            else -> {
+                Log.w(TAG, "Continue clicked but nextAction=${state.nextAction} not handled")
+            }
         }
     }
 
@@ -285,6 +303,13 @@ class UnifiedChatViewModel @Inject constructor(
      */
     fun clearNavigateToPlaceSearch() {
         _navigateToPlaceSearch.value = null
+    }
+
+    /**
+     * Clear CallSummary navigation event after handling.
+     */
+    fun clearNavigateToCallSummary() {
+        _navigateToCallSummary.value = false
     }
 
     /**

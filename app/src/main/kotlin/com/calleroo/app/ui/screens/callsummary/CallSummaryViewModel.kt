@@ -104,6 +104,7 @@ class CallSummaryViewModel @Inject constructor(
     fun initialize(taskSession: TaskSessionViewModel) {
         val resolvedPlace = taskSession.resolvedPlace.value
         if (resolvedPlace == null) {
+            Log.e(TAG, "initialize: No place selected")
             _state.value = CallSummaryState.Error("No place selected")
             return
         }
@@ -113,6 +114,10 @@ class CallSummaryViewModel @Inject constructor(
         this.slots = taskSession.slots.value
         this.currentPlace = resolvedPlace
         this.currentPhone = resolvedPlace.phoneE164
+
+        Log.d(TAG, "initialize: conversationId=$conversationId, agentType=$agentType")
+        Log.d(TAG, "initialize: slots.keys=${slots.keys}")
+        Log.d(TAG, "initialize: resolvedPlace.businessName=${resolvedPlace.businessName}, phone=${resolvedPlace.phoneE164}")
 
         loadCallBrief()
     }

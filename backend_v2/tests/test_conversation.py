@@ -1245,3 +1245,196 @@ class TestExtractedDataSanitization:
         assert "caller_name" in response.extractedData
         assert response.extractedData["caller_name"] == "richard"
         assert "slot" not in response.extractedData
+
+
+class TestSlotMergeBug:
+    """Tests for the slot merge bug that caused 'caller_name asked twice'.
+
+    Root cause: When sanitize_conversation_response computed nextMissingSlot,
+    it used request.slots (what client sent) instead of mergedSlots
+    (existing + extractedData). This caused it to ask for a slot that
+    was just extracted.
+    """
+
+    def test_shift_answer_does_not_reset_caller_name(self):
+        """Test that answering shift_date doesn't cause caller_name to be asked again.
+
+        Scenario:
+        - existingSlots contains caller_name="Richard"
+        - extractedData contains shift_date + shift_start_time
+        - nextMissing should NOT be caller_name (should be reason_category)
+        """
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction
+
+        # Simulate: user already provided caller_name, now provided shift info
+        existing_slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+            "caller_name": "Richard",  # Already collected!
+        }
+
+        # Model extracted shift_date and shift_start_time from "today at 6pm"
+        response = ConversationResponse(
+            assistantMessage="Got it, today at 6pm.",
+            nextAction=NextAction.ASK_QUESTION,
+            question=None,  # Model didn't provide a question (will be auto-generated)
+            extractedData={
+                "shift_date": "2026-02-01",
+                "shift_start_time": "6:00pm",
+            },
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(
+            response, "test-conv-shift", "SICK_CALLER", existing_slots
+        )
+
+        # Question should be for reason_category (next after shift_start_time)
+        # NOT caller_name (which is already filled)
+        assert sanitized.question is not None
+        assert sanitized.question.field == "reason_category", \
+            f"Expected reason_category, got {sanitized.question.field}"
+        assert sanitized.question.field != "caller_name", \
+            "Bug: caller_name was asked again even though it's already filled"
+
+    def test_extracted_data_null_does_not_wipe_slots(self):
+        """Test that null extractedData doesn't cause slots to be asked again.
+
+        Scenario:
+        - existingSlots contains caller_name="Richard"
+        - extractedData is None/null
+        - mergedSlots should still contain caller_name
+        """
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction
+
+        existing_slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+            "caller_name": "Richard",
+        }
+
+        # Response with null extractedData
+        response = ConversationResponse(
+            assistantMessage="When is your shift?",
+            nextAction=NextAction.ASK_QUESTION,
+            question=None,
+            extractedData=None,  # Null!
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(
+            response, "test-conv-null", "SICK_CALLER", existing_slots
+        )
+
+        # Should ask for shift_date (next missing), not employer_name or caller_name
+        assert sanitized.question is not None
+        assert sanitized.question.field == "shift_date", \
+            f"Expected shift_date, got {sanitized.question.field}"
+        # extractedData should be normalized to {} (never null)
+        assert sanitized.extractedData is not None
+        assert sanitized.extractedData == {}
+
+    def test_merged_slots_used_for_next_missing(self):
+        """Test that mergedSlots (existing + extracted) is used to compute next question.
+
+        Scenario:
+        - existingSlots = {employer_name, employer_phone}
+        - extractedData = {caller_name, shift_date}
+        - nextMissing should be shift_start_time (not caller_name)
+        """
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction
+
+        existing_slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+        }
+
+        # Model extracted caller_name and shift_date in one response
+        response = ConversationResponse(
+            assistantMessage="Got it, Richard, shift on Feb 1.",
+            nextAction=NextAction.ASK_QUESTION,
+            question=None,  # Will be auto-generated
+            extractedData={
+                "caller_name": "Richard",
+                "shift_date": "2026-02-01",
+            },
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(
+            response, "test-conv-merge", "SICK_CALLER", existing_slots
+        )
+
+        # mergedSlots = {employer_name, employer_phone, caller_name, shift_date}
+        # Next missing should be shift_start_time
+        assert sanitized.question is not None
+        assert sanitized.question.field == "shift_start_time", \
+            f"Expected shift_start_time, got {sanitized.question.field}"
+
+    def test_confirm_downgrade_uses_merged_slots(self):
+        """Test that CONFIRM without card downgrade uses merged slots."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction
+
+        existing_slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+            "caller_name": "Richard",
+            "shift_date": "2026-02-01",
+        }
+
+        # Model returned CONFIRM but no card, and extracted shift_start_time
+        response = ConversationResponse(
+            assistantMessage="Let me confirm.",
+            nextAction=NextAction.CONFIRM,
+            question=None,
+            extractedData={"shift_start_time": "9:00am"},
+            confirmationCard=None,  # Missing! Will trigger downgrade
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(
+            response, "test-conv-confirm", "SICK_CALLER", existing_slots
+        )
+
+        # Should downgrade to ASK_QUESTION
+        assert sanitized.nextAction == NextAction.ASK_QUESTION
+        # Should ask for reason_category (all other slots filled via merge)
+        assert sanitized.question is not None
+        assert sanitized.question.field == "reason_category", \
+            f"Expected reason_category, got {sanitized.question.field}"
+
+    def test_extracted_data_always_returned_as_dict(self):
+        """Test that extractedData is always {} not null in response."""
+        from app.main import sanitize_conversation_response
+        from app.models import ConversationResponse, NextAction, Question, InputType
+
+        # Valid response with null extractedData
+        response = ConversationResponse(
+            assistantMessage="What's your name?",
+            nextAction=NextAction.ASK_QUESTION,
+            question=Question(
+                text="What's your name?",
+                field="caller_name",
+                inputType=InputType.TEXT,
+            ),
+            extractedData=None,  # Null
+            aiCallMade=True,
+            aiModel="gpt-4o-mini"
+        )
+
+        sanitized = sanitize_conversation_response(
+            response, "test-conv-normalize", "SICK_CALLER", {}
+        )
+
+        # extractedData should be normalized to {} (never null)
+        assert sanitized.extractedData is not None
+        assert isinstance(sanitized.extractedData, dict)
+        assert sanitized.extractedData == {}

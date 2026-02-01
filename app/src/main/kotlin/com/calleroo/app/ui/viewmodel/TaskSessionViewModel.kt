@@ -1,5 +1,6 @@
 package com.calleroo.app.ui.viewmodel
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import com.calleroo.app.domain.model.AgentType
 import com.calleroo.app.domain.model.ResolvedPlace
@@ -10,6 +11,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import javax.inject.Inject
+
+private const val TAG = "TaskSessionViewModel"
 
 /**
  * ViewModel scoped to the task flow navigation graph.
@@ -42,8 +45,19 @@ class TaskSessionViewModel @Inject constructor() : ViewModel() {
     /**
      * Initialize the task session with conversation parameters.
      * Called by Chat screen when it starts.
+     *
+     * IMPORTANT: This is idempotent - if already initialized for this conversationId,
+     * it will NOT reset slots/resolvedPlace. This prevents losing state on recomposition.
      */
     fun initSession(conversationId: String, agentType: AgentType) {
+        // Guard: don't reinitialize if already set for this conversation
+        // This prevents losing slots on screen recomposition
+        if (this.conversationId == conversationId) {
+            Log.d(TAG, "initSession: already initialized for $conversationId, skipping reset")
+            return
+        }
+
+        Log.d(TAG, "initSession: conversationId=$conversationId, agentType=$agentType")
         this.conversationId = conversationId
         this.agentType = agentType
         _slots.value = buildJsonObject {}
@@ -55,6 +69,7 @@ class TaskSessionViewModel @Inject constructor() : ViewModel() {
      * Called after each /conversation/next response merges extractedData.
      */
     fun updateSlots(newSlots: JsonObject) {
+        Log.d(TAG, "updateSlots: keys=${newSlots.keys}, conversationId=$conversationId")
         _slots.value = newSlots
     }
 

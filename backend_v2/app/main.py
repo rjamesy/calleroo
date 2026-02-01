@@ -253,15 +253,33 @@ REQUIRED_SLOTS_MAP = {
 }
 
 
-def _get_next_missing_slot(agent_type: str, slots: dict) -> tuple:
+def _get_next_missing_slot(agent_type: str, slots: dict, conversation_id: str = "unknown") -> tuple:
     """Find the next missing required slot for an agent type.
 
     Returns (field, question_text, input_type) or None if all present.
+
+    CRITICAL: slots should be the MERGED slots (existing + extractedData)
+    to avoid asking for a slot that was just extracted.
     """
     required = REQUIRED_SLOTS_MAP.get(agent_type, [])
+    filled_slots = [f for f, _, _ in required if f in slots and slots.get(f)]
+    missing_slots = [f for f, _, _ in required if f not in slots or not slots.get(f)]
+
     for field, question_text, input_type in required:
         if field not in slots or not slots.get(field):
+            # Log for debugging
+            logger.debug(
+                f"nextMissingSlot: agent={agent_type}, "
+                f"filled={filled_slots}, missing={missing_slots}, "
+                f"next={field}, conversationId={conversation_id}"
+            )
             return (field, question_text, input_type)
+
+    logger.debug(
+        f"nextMissingSlot: agent={agent_type}, "
+        f"filled={filled_slots}, missing=[], next=None (all complete), "
+        f"conversationId={conversation_id}"
+    )
     return None
 
 
@@ -276,7 +294,7 @@ def _create_endpoint_fallback_response(
     """
     from .models import Question, InputType, Confidence
 
-    next_slot = _get_next_missing_slot(agent_type, slots)
+    next_slot = _get_next_missing_slot(agent_type, slots, conversation_id)
 
     if next_slot:
         field, question_text, input_type_str = next_slot
@@ -331,17 +349,35 @@ def sanitize_conversation_response(
     Validate and auto-repair conversation response for schema completeness.
     Logs warnings and returns a sanitized response.
 
+    CRITICAL: mergedSlots = existing_slots + extractedData is used for nextMissingSlot.
+    This ensures we don't ask for slots the model just extracted.
+
     Auto-repairs:
     - FIND_PLACE without placeSearchParams -> ASK_QUESTION with generated question
     - CONFIRM without confirmationCard -> ASK_QUESTION with generated question
     - Empty assistantMessage -> use question.text or fallback message
     - Conflicting blocks (e.g., FIND_PLACE with question) -> drop irrelevant blocks
     - ASK_QUESTION without question -> generate question for next missing slot
+    - extractedData null -> normalize to {}
     """
     from .models import Question, InputType, Confidence
 
     if slots is None:
         slots = {}
+
+    # CRITICAL FIX: Merge existing slots with extractedData BEFORE computing nextMissingSlot
+    # This prevents asking for a slot that was just extracted
+    extracted_data = response.extractedData if response.extractedData else {}
+    merged_slots = {**slots, **extracted_data}
+
+    # Log for debugging slot merge issues
+    if extracted_data:
+        logger.debug(
+            f"Slot merge: existing={list(slots.keys())}, "
+            f"extracted={list(extracted_data.keys())}, "
+            f"merged={list(merged_slots.keys())} "
+            f"conversationId={conversation_id}"
+        )
 
     warnings = []
     repairs = []
@@ -359,8 +395,8 @@ def sanitize_conversation_response(
             warnings.append("FIND_PLACE_missing_placeSearchParams")
             next_action = NextAction.ASK_QUESTION
             repairs.append("downgraded_to_ASK_QUESTION")
-            # Generate a question for next missing slot
-            next_slot = _get_next_missing_slot(agent_type, slots)
+            # Generate a question for next missing slot (using merged_slots!)
+            next_slot = _get_next_missing_slot(agent_type, merged_slots, conversation_id)
             if next_slot:
                 field, q_text, input_type_str = next_slot
                 try:
@@ -389,8 +425,8 @@ def sanitize_conversation_response(
             warnings.append("CONFIRM_missing_confirmationCard")
             next_action = NextAction.ASK_QUESTION
             repairs.append("downgraded_to_ASK_QUESTION")
-            # Generate a question for next missing slot
-            next_slot = _get_next_missing_slot(agent_type, slots)
+            # Generate a question for next missing slot (using merged_slots!)
+            next_slot = _get_next_missing_slot(agent_type, merged_slots, conversation_id)
             if next_slot:
                 field, q_text, input_type_str = next_slot
                 try:
@@ -415,8 +451,8 @@ def sanitize_conversation_response(
     elif next_action == NextAction.ASK_QUESTION:
         if question is None:
             warnings.append("ASK_QUESTION_missing_question")
-            # Generate a question for next missing slot
-            next_slot = _get_next_missing_slot(agent_type, slots)
+            # Generate a question for next missing slot (using merged_slots!)
+            next_slot = _get_next_missing_slot(agent_type, merged_slots, conversation_id)
             if next_slot:
                 field, q_text, input_type_str = next_slot
                 try:
@@ -463,21 +499,25 @@ def sanitize_conversation_response(
             f"warnings={warnings}, repairs={repairs}"
         )
 
-    # Return sanitized response if repairs were made
-    if repairs:
-        return ConversationResponse(
-            assistantMessage=assistant_message,
-            nextAction=next_action,
-            question=question,
-            extractedData=response.extractedData,
-            confidence=response.confidence,
-            confirmationCard=confirmation_card if next_action == NextAction.CONFIRM else None,
-            placeSearchParams=place_search_params if next_action == NextAction.FIND_PLACE else None,
-            aiCallMade=response.aiCallMade,
-            aiModel=response.aiModel
-        )
+    # CRITICAL FIX: Always return merged_slots (existing + extracted) to maintain full slot state
+    # This ensures the client receives ALL known slots, not just newly extracted ones.
+    # Without this, the client sends back stale slots on the next turn, causing slot amnesia.
+    #
+    # Before fix: extractedData = {"caller_name": "Richard"}  (only new slots)
+    # After fix:  extractedData = {"employer_name": "Bunnings", "caller_name": "Richard", ...}  (all slots)
 
-    return response
+    # Return sanitized response - ALWAYS include merged_slots as extractedData
+    return ConversationResponse(
+        assistantMessage=assistant_message,
+        nextAction=next_action,
+        question=question,
+        extractedData=merged_slots,  # CRITICAL: Return FULL merged slots, not just new extractions
+        confidence=response.confidence,
+        confirmationCard=confirmation_card if next_action == NextAction.CONFIRM else None,
+        placeSearchParams=place_search_params if next_action == NextAction.FIND_PLACE else None,
+        aiCallMade=response.aiCallMade,
+        aiModel=response.aiModel
+    )
 
 
 @app.post("/conversation/next", response_model=ConversationResponse)
@@ -531,21 +571,28 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
             # User tapped "Yes, call them" - proceed to COMPLETE (or FIND_PLACE if no phone yet)
             logger.info(
                 f"METRIC client_action_confirm conversationId={request.conversationId} "
-                f"agent={request.agentType.value}"
+                f"agent={request.agentType.value} "
+                f"slots_keys={list(request.slots.keys()) if request.slots else []}"
             )
 
-            # Check if we have all required slots for the next step
-            # For now, just return COMPLETE to proceed with the call
+            # CRITICAL: Preserve all slots in extractedData
+            # Without this, Android loses all slot state after CONFIRM
+            preserved_slots = request.slots if request.slots else {}
+
             response = ConversationResponse(
                 assistantMessage="Okay — placing the call now.",
                 nextAction=NextAction.COMPLETE,
                 question=None,
-                extractedData=None,
+                extractedData=preserved_slots,  # CRITICAL: Preserve all slots
                 confidence=Confidence.HIGH,
                 confirmationCard=None,
                 placeSearchParams=None,
                 aiCallMade=False,
                 aiModel="deterministic",
+            )
+
+            logger.info(
+                f"CONFIRM response: extractedData keys={list(preserved_slots.keys())}"
             )
 
             # Store for idempotency
@@ -558,10 +605,15 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
             # User tapped "Not quite" - ask what needs to be corrected
             logger.info(
                 f"METRIC client_action_reject conversationId={request.conversationId} "
-                f"agent={request.agentType.value}"
+                f"agent={request.agentType.value} "
+                f"slots_keys={list(request.slots.keys()) if request.slots else []}"
             )
 
             from .models import Question, InputType
+
+            # CRITICAL: Preserve all slots in extractedData
+            # Without this, Android loses all slot state after REJECT
+            preserved_slots = request.slots if request.slots else {}
 
             response = ConversationResponse(
                 assistantMessage="No problem! What would you like to change?",
@@ -573,12 +625,16 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
                     choices=None,
                     optional=False,
                 ),
-                extractedData=None,
+                extractedData=preserved_slots,  # CRITICAL: Preserve all slots
                 confidence=Confidence.HIGH,
                 confirmationCard=None,
                 placeSearchParams=None,
                 aiCallMade=False,
                 aiModel="deterministic",
+            )
+
+            logger.info(
+                f"REJECT response: extractedData keys={list(preserved_slots.keys())}"
             )
 
             # Store for idempotency
@@ -603,12 +659,25 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
         )
 
         # Sanitize response: validate and auto-repair invalid combinations
+        # This now returns merged_slots (existing + extracted) as extractedData
         response = sanitize_conversation_response(
             response,
             request.conversationId,
             request.agentType.value,
             request.slots,
         )
+
+        # Log slot sync warning if client slots are behind merged state
+        if response.extractedData and request.slots:
+            merged_keys = set(response.extractedData.keys())
+            client_keys = set(request.slots.keys())
+            new_keys = merged_keys - client_keys
+            if new_keys:
+                logger.info(
+                    f"Slot sync: client missing keys={list(new_keys)}, "
+                    f"returning full merged state with {len(merged_keys)} keys "
+                    f"conversationId={request.conversationId}"
+                )
 
         # Log the response
         logger.info(
