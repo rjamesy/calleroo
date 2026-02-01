@@ -1081,6 +1081,8 @@ async def call_status(call_id: str) -> CallStatusResponseV1:
         transcript=call_run.transcript,
         outcome=call_run.outcome,
         error=call_run.error,
+        cost=call_run.cost,
+        costCurrency=call_run.cost_currency,
     )
 
 

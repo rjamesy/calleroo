@@ -266,6 +266,9 @@ class CallStatusResponseV1(BaseModel):
     transcript: Optional[str] = None
     outcome: Optional[Dict[str, Any]] = None  # OpenAI analysis
     error: Optional[str] = None
+    # Call cost (optional - may not be immediately available from Twilio)
+    cost: Optional[float] = None
+    costCurrency: Optional[str] = None
 
 
 # ============================================================

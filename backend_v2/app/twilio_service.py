@@ -64,6 +64,14 @@ class CallRun:
     # Terminal state - call is ending, no more Gather needed
     is_terminal: bool = False
 
+    # Sick-caller hard state (deterministic)
+    message_confirm_asked: bool = False
+    message_confirm_result: Optional[str] = None  # "YES" | "NO" | "PASS_ON"
+
+    # Call cost tracking (optional - may not be immediately available)
+    cost: Optional[float] = None
+    cost_currency: Optional[str] = None
+
 
 # In-memory storage for call runs (acceptable for MVP)
 CALL_RUNS: Dict[str, CallRun] = {}
@@ -113,6 +121,29 @@ Respond with JSON only:
   "confidence": "LOW|MEDIUM|HIGH"
 }}"""
 
+
+SICK_CALLER_PHONE_AGENT_PROMPT = """
+You are Calleroo, an AI assistant placing a short phone call to notify an employer that the customer is unwell.
+
+ABSOLUTE RULES (MUST FOLLOW):
+- Follow the exact call flow below. Do not deviate.
+- Do NOT ask about "replacement".
+- Ask ONE closing question ONLY (confirmation of receipt).
+- If they confirm, thank them and end the call.
+- If they do not confirm / wrong person, ask them to pass it on, then end the call.
+- Keep turns short: 1 sentence per turn.
+- Do not ask open-ended questions.
+- End the call after goodbye. Never speak again.
+
+CALL FLOW (STRICT):
+A) Greeting: "Hello, is this <employer_name>?"
+B) Identify: "My name is Calleroo, an AI assistant calling on behalf of <caller_name> using the Calleroo mobile app."
+C) Message: "<caller_name> is unwell and won't be able to attend their shift on <shift_date> starting at <shift_start_time>."
+D) Closing confirmation (ONCE): "Could you please confirm you've received that message?"
+E) If YES: "Thank you. Goodbye."
+   If NO / unsure / wrong person: "No worries—could you please pass this message on? Thank you. Goodbye."
+F) After goodbye, never speak again.
+"""
 
 PHONE_AGENT_SYSTEM_PROMPT = """You are Calleroo, a calm, professional phone assistant making an outbound call on behalf of a customer.
 
@@ -236,6 +267,55 @@ def _contains_info(speech: str) -> bool:
             return True
 
     return False
+
+
+# ============================================================
+# SICK_CALLER: YES/NO/PASS-ON Detection Helpers
+# ============================================================
+
+NEGATIVE_ANSWERS = [
+    "no", "nope", "nah", "not needed", "don't need", "do not need", "all good",
+    "we're fine", "no thanks", "can't", "cannot", "not really"
+]
+
+POSITIVE_ANSWERS = [
+    "yes", "yeah", "yep", "sure", "ok", "okay", "got it", "received",
+    "understood", "will do", "noted", "thanks", "thank you"
+]
+
+PASS_ON_PHRASES = [
+    "not me", "wrong person", "not the manager", "not sure", "can't help",
+    "speak to", "call back", "pass it on", "i'll tell", "i can tell",
+    "let them know", "i will let", "send to", "wrong number", "who is this",
+    "i'm not", "im not", "that's not me"
+]
+
+
+def _detect_yes_no(speech: str) -> Optional[str]:
+    """Detect if speech is a YES or NO answer.
+
+    Returns "YES", "NO", or None if unclear.
+    """
+    s = speech.lower().strip()
+
+    # Check negative first (more important to catch)
+    if any(p in s for p in NEGATIVE_ANSWERS):
+        return "NO"
+
+    # Check positive
+    if any(p in s for p in POSITIVE_ANSWERS):
+        return "YES"
+
+    return None
+
+
+def _detect_pass_on(speech: str) -> bool:
+    """Detect if user is indicating they're the wrong person or can't help.
+
+    Returns True if speech suggests passing on the message.
+    """
+    s = speech.lower().strip()
+    return any(p in s for p in PASS_ON_PHRASES)
 
 
 def _is_pure_hold_phrase(speech: str) -> bool:
@@ -426,6 +506,17 @@ class TwilioService:
         call_run.status = status
         if duration is not None:
             call_run.duration_seconds = duration
+
+        # OPTIONAL: Fetch call cost when completed (may not be immediately available)
+        if status == "completed" and self.client:
+            try:
+                call = self.client.calls(call_id).fetch()
+                if getattr(call, "price", None) is not None:
+                    call_run.cost = abs(float(call.price))
+                    call_run.cost_currency = call.price_unit or "USD"
+                    logger.info(f"Call {call_id} cost: {call_run.cost} {call_run.cost_currency}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch cost for call {call_id}: {e}")
 
         logger.info(f"Call {call_id} status updated to {status}")
 
@@ -721,9 +812,58 @@ class TwilioService:
             logger.error("generate_agent_response: OpenAI not configured")
             return "I'm sorry, I'm having technical difficulties. Please try again later."
 
+        # ============================================================
+        # SICK_CALLER: Deterministic guard BEFORE calling OpenAI
+        # If we've already asked for confirmation, force a terminal response
+        # ============================================================
+        if call_run.agent_type == "SICK_CALLER" and call_run.message_confirm_asked:
+            # Check for pass-on indicators first (wrong person)
+            if _detect_pass_on(user_speech):
+                call_run.message_confirm_result = "PASS_ON"
+                call_run.is_terminal = True
+                logger.info(f"SICK_CALLER: Pass-on detected, ending call. Speech: {user_speech[:50]}...")
+                return "No worries—could you please pass this message on? Thank you. Goodbye."
+
+            # Check for YES/NO
+            yn = _detect_yes_no(user_speech)
+            if yn == "YES":
+                call_run.message_confirm_result = "YES"
+                call_run.is_terminal = True
+                logger.info(f"SICK_CALLER: Confirmation received (YES), ending call. Speech: {user_speech[:50]}...")
+                return "Thank you. Goodbye."
+            if yn == "NO":
+                call_run.message_confirm_result = "NO"
+                call_run.is_terminal = True
+                logger.info(f"SICK_CALLER: Confirmation negative (NO), ending call. Speech: {user_speech[:50]}...")
+                return "No worries—could you please pass this message on? Thank you. Goodbye."
+
+            # If unclear, let OpenAI handle but still constrained by prompt
+            logger.info(f"SICK_CALLER: Confirmation asked but response unclear, letting LLM handle: {user_speech[:50]}...")
+
         try:
             # Build conversation history from live_transcript
             transcript_text = "\n".join(call_run.live_transcript)
+
+            # ============================================================
+            # Select system prompt by agent_type
+            # ============================================================
+            system_prompt = PHONE_AGENT_SYSTEM_PROMPT
+
+            if call_run.agent_type == "SICK_CALLER":
+                # Use SICK_CALLER specific prompt with slot values injected
+                employer_name = str(call_run.slots.get("employer_name", "your workplace"))
+                caller_name = str(call_run.slots.get("caller_name", "the customer"))
+                shift_date = str(call_run.slots.get("shift_date", "your shift date"))
+                shift_start_time = str(call_run.slots.get("shift_start_time", "your shift time"))
+
+                system_prompt = (SICK_CALLER_PHONE_AGENT_PROMPT
+                    .replace("<employer_name>", employer_name)
+                    .replace("<caller_name>", caller_name)
+                    .replace("<shift_date>", shift_date)
+                    .replace("<shift_start_time>", shift_start_time)
+                )
+
+                logger.info(f"SICK_CALLER: Using dedicated prompt with slots: employer={employer_name}, caller={caller_name}")
 
             # Build user message with context
             user_message = f"""Conversation so far:
@@ -742,7 +882,7 @@ What should you say next?"""
             response = await self.openai_client.chat.completions.create(
                 model=self.openai_model,
                 messages=[
-                    {"role": "system", "content": PHONE_AGENT_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
                 temperature=0.7,
@@ -757,29 +897,48 @@ What should you say next?"""
             # Clean up response (remove quotes if present)
             content = content.strip().strip('"').strip("'")
 
-            # Deterministic guard: prevent repeating the same question
-            # But ALLOW repeat if user provided new info (numbers, yes/no, prices)
-            new_question = self._extract_question(content)
-            if new_question and call_run.last_question:
-                # Check if it's substantially the same question (case-insensitive, normalized)
-                if self._is_same_question(new_question, call_run.last_question):
-                    # Only block if user speech didn't contain new info
-                    user_provided_info = _contains_info(user_speech)
-                    if not user_provided_info:
-                        logger.warning(f"Detected repeat question without new user info, replacing with wait acknowledgement. Original: {content[:50]}...")
-                        content = "No worries—take your time. Let me know when you're ready."
-                        # Don't update last_question since we're not asking a new one
+            # ============================================================
+            # SICK_CALLER: Mark confirmation asked if LLM asked it
+            # ============================================================
+            if call_run.agent_type == "SICK_CALLER":
+                content_lower = content.lower()
+                if ("confirm" in content_lower and "received" in content_lower) or \
+                   ("confirm" in content_lower and "message" in content_lower) or \
+                   "is that okay" in content_lower or \
+                   "did you get that" in content_lower:
+                    call_run.message_confirm_asked = True
+                    logger.info(f"SICK_CALLER: Marked message_confirm_asked=True. Response: {content[:50]}...")
+
+                # Detect goodbye - mark terminal
+                if "goodbye" in content_lower or "good bye" in content_lower:
+                    call_run.is_terminal = True
+                    logger.info(f"SICK_CALLER: Goodbye detected, marked terminal. Response: {content[:50]}...")
+
+            # Deterministic guard: prevent repeating the same question (non-SICK_CALLER)
+            # For SICK_CALLER, the deterministic guard above handles this
+            if call_run.agent_type != "SICK_CALLER":
+                # But ALLOW repeat if user provided new info (numbers, yes/no, prices)
+                new_question = self._extract_question(content)
+                if new_question and call_run.last_question:
+                    # Check if it's substantially the same question (case-insensitive, normalized)
+                    if self._is_same_question(new_question, call_run.last_question):
+                        # Only block if user speech didn't contain new info
+                        user_provided_info = _contains_info(user_speech)
+                        if not user_provided_info:
+                            logger.warning(f"Detected repeat question without new user info, replacing with wait acknowledgement. Original: {content[:50]}...")
+                            content = "No worries—take your time. Let me know when you're ready."
+                            # Don't update last_question since we're not asking a new one
+                        else:
+                            # User provided info, so this is likely a legitimate follow-up
+                            # Allow it through and update last_question
+                            logger.info(f"Allowing similar question because user provided new info: {user_speech[:50]}...")
+                            call_run.last_question = new_question
                     else:
-                        # User provided info, so this is likely a legitimate follow-up
-                        # Allow it through and update last_question
-                        logger.info(f"Allowing similar question because user provided new info: {user_speech[:50]}...")
+                        # Different question - update last_question
                         call_run.last_question = new_question
-                else:
-                    # Different question - update last_question
+                elif new_question:
+                    # First question - store it
                     call_run.last_question = new_question
-            elif new_question:
-                # First question - store it
-                call_run.last_question = new_question
 
             logger.info(f"Agent response generated: {content[:100]}...")
             return content
