@@ -294,7 +294,15 @@ fun UnifiedChatScreen(
             if (!uiState.showContinueButton) {
                 ChatInputBar(
                     question = uiState.currentQuestion,
-                    onSend = { viewModel.sendMessage(it) },
+                    onSend = { userInput ->
+                        // FIX 5: Persist TEXT input locally before sending to backend
+                        // This ensures slots like caller_name are saved immediately
+                        val field = uiState.currentQuestion?.field
+                        if (!field.isNullOrBlank() && userInput.isNotBlank()) {
+                            viewModel.injectSlot(field, userInput)
+                        }
+                        viewModel.sendMessage(userInput)
+                    },
                     onFindNumber = {
                         // ✅ FIX 3: use jsonPrimitive.content (avoid quoted strings / "null")
                         val employerName = uiState.slots["employer_name"]
