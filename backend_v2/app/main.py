@@ -20,6 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from .models import (
+    ClientAction,
+    Confidence,
     ConversationRequest,
     ConversationResponse,
     NextAction,
@@ -91,6 +93,39 @@ places_service: Optional[GooglePlacesService] = None
 call_brief_service: Optional[CallBriefService] = None
 twilio_service: Optional[TwilioService] = None
 call_result_service: Optional[CallResultService] = None
+
+# Idempotency store for preventing duplicate confirmations
+# Key: idempotencyKey, Value: (response, timestamp)
+# In production, use Redis or a database
+from typing import Dict, Tuple
+from datetime import datetime, timedelta
+
+_idempotency_store: Dict[str, Tuple[ConversationResponse, datetime]] = {}
+_IDEMPOTENCY_TTL = timedelta(minutes=5)
+
+
+def _get_idempotent_response(key: str) -> Optional[ConversationResponse]:
+    """Get cached response for idempotency key if still valid."""
+    if key in _idempotency_store:
+        response, timestamp = _idempotency_store[key]
+        if datetime.now() - timestamp < _IDEMPOTENCY_TTL:
+            logger.info(f"Idempotency hit for key={key}")
+            return response
+        else:
+            # Expired, remove it
+            del _idempotency_store[key]
+    return None
+
+
+def _store_idempotent_response(key: str, response: ConversationResponse) -> None:
+    """Store response for idempotency."""
+    _idempotency_store[key] = (response, datetime.now())
+    # Clean up old entries (simple LRU-ish cleanup)
+    if len(_idempotency_store) > 1000:
+        cutoff = datetime.now() - _IDEMPOTENCY_TTL
+        keys_to_remove = [k for k, (_, ts) in _idempotency_store.items() if ts < cutoff]
+        for k in keys_to_remove:
+            del _idempotency_store[k]
 
 
 def _mask_key(key: Optional[str]) -> str:
@@ -450,10 +485,9 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
     """
     Process the next turn in a conversation.
 
-    CRITICAL: This endpoint ALWAYS calls OpenAI.
-    - NO local question logic
-    - NO pre-extraction heuristics
-    - NO fallback flows
+    Flow:
+    1. If clientAction is CONFIRM/REJECT, handle deterministically (bypass OpenAI)
+    2. Otherwise, ALWAYS call OpenAI
 
     GUARANTEE: This endpoint NEVER returns HTTP 500 due to model output.
     - Invalid JSON from model: parsed, extracted, or repaired
@@ -472,16 +506,94 @@ async def conversation_next(request: ConversationRequest) -> ConversationRespons
     logger.info(
         f"Conversation turn: id={request.conversationId}, "
         f"agent={request.agentType}, "
+        f"clientAction={request.clientAction}, "
         f"message='{msg_preview}'"
     )
 
     # TOP-LEVEL EXCEPTION BARRIER: wrap everything to guarantee no 500s from model output
     try:
+        # ============================================================
+        # IDEMPOTENCY CHECK: prevent duplicate actions (e.g., double-tap confirm)
+        # ============================================================
+        if request.idempotencyKey:
+            cached_response = _get_idempotent_response(request.idempotencyKey)
+            if cached_response:
+                logger.info(
+                    f"METRIC idempotency_hit conversationId={request.conversationId} "
+                    f"key={request.idempotencyKey}"
+                )
+                return cached_response
+
+        # ============================================================
+        # DETERMINISTIC CLIENT ACTIONS: bypass OpenAI for CONFIRM/REJECT
+        # ============================================================
+        if request.clientAction == ClientAction.CONFIRM:
+            # User tapped "Yes, call them" - proceed to COMPLETE (or FIND_PLACE if no phone yet)
+            logger.info(
+                f"METRIC client_action_confirm conversationId={request.conversationId} "
+                f"agent={request.agentType.value}"
+            )
+
+            # Check if we have all required slots for the next step
+            # For now, just return COMPLETE to proceed with the call
+            response = ConversationResponse(
+                assistantMessage="Okay — placing the call now.",
+                nextAction=NextAction.COMPLETE,
+                question=None,
+                extractedData=None,
+                confidence=Confidence.HIGH,
+                confirmationCard=None,
+                placeSearchParams=None,
+                aiCallMade=False,
+                aiModel="deterministic",
+            )
+
+            # Store for idempotency
+            if request.idempotencyKey:
+                _store_idempotent_response(request.idempotencyKey, response)
+
+            return response
+
+        elif request.clientAction == ClientAction.REJECT:
+            # User tapped "Not quite" - ask what needs to be corrected
+            logger.info(
+                f"METRIC client_action_reject conversationId={request.conversationId} "
+                f"agent={request.agentType.value}"
+            )
+
+            from .models import Question, InputType
+
+            response = ConversationResponse(
+                assistantMessage="No problem! What would you like to change?",
+                nextAction=NextAction.ASK_QUESTION,
+                question=Question(
+                    text="What would you like to change?",
+                    field="correction",
+                    inputType=InputType.TEXT,
+                    choices=None,
+                    optional=False,
+                ),
+                extractedData=None,
+                confidence=Confidence.HIGH,
+                confirmationCard=None,
+                placeSearchParams=None,
+                aiCallMade=False,
+                aiModel="deterministic",
+            )
+
+            # Store for idempotency
+            if request.idempotencyKey:
+                _store_idempotent_response(request.idempotencyKey, response)
+
+            return response
+
+        # ============================================================
+        # NORMAL FLOW: Call OpenAI
+        # ============================================================
         if openai_service is None:
             raise HTTPException(status_code=503, detail="Service not initialized")
 
-        # ALWAYS call OpenAI - this is non-negotiable
-        # The service guarantees no exceptions from model output
+        # Call OpenAI - the service guarantees no exceptions from model output
         response = await openai_service.get_next_turn(
             agent_type=request.agentType,
             user_message=request.userMessage,

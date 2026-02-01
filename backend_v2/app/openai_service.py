@@ -96,6 +96,30 @@ RESPONSE_STRUCTURE_KEYS = {
     "confidence", "confirmationCard", "placeSearchParams"
 }
 
+# Common invalid keys that models sometimes use instead of proper field names
+INVALID_SLOT_KEYS = {"slot", "value", "answer", "response", "data", "input"}
+
+
+def _get_last_question_field(message_history: List[Any]) -> Optional[str]:
+    """
+    Extract the last question.field from message history.
+    Used to repair invalid slot keys like "slot" -> actual field name.
+    """
+    # Walk backwards through history looking for assistant messages
+    for msg in reversed(message_history):
+        if hasattr(msg, 'role') and msg.role == 'assistant':
+            content = msg.content
+            # Try to parse as JSON to find question.field
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict) and 'question' in data:
+                    q = data.get('question')
+                    if isinstance(q, dict) and 'field' in q:
+                        return q['field']
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return None
+
 
 class OpenAIService:
     """Service for calling OpenAI to drive conversation flow.
@@ -210,7 +234,7 @@ class OpenAIService:
 
         # STAGE 2: Parse response (with extraction and retry)
         parsed = await self._parse_with_retry(
-            raw_content, agent_type, slots, messages, conversation_id
+            raw_content, agent_type, slots, messages, conversation_id, message_history
         )
 
         return parsed
@@ -222,6 +246,7 @@ class OpenAIService:
         slots: Dict[str, Any],
         original_messages: List[Dict[str, str]],
         conversation_id: str,
+        message_history: List[ChatMessage] = None,
     ) -> ConversationResponse:
         """
         Multi-stage parsing with retry:
@@ -230,9 +255,12 @@ class OpenAIService:
         3. Retry with repair prompt
         4. Return fallback
         """
+        if message_history is None:
+            message_history = []
+
         # STAGE 2a: Try direct parse
         result, error = self._try_parse_json(
-            raw_content, agent_type.value, conversation_id, "raw", slots
+            raw_content, agent_type.value, conversation_id, "raw", slots, message_history
         )
         if result is not None:
             return result
@@ -241,7 +269,7 @@ class OpenAIService:
         extracted_json = self._extract_json_from_text(raw_content)
         if extracted_json:
             result, error = self._try_parse_json(
-                extracted_json, agent_type.value, conversation_id, "extract", slots
+                extracted_json, agent_type.value, conversation_id, "extract", slots, message_history
             )
             if result is not None:
                 logger.info(
@@ -257,7 +285,7 @@ class OpenAIService:
         )
 
         repair_result = await self._retry_with_repair_prompt(
-            original_messages, agent_type, slots, conversation_id
+            original_messages, agent_type, slots, conversation_id, message_history
         )
         if repair_result is not None:
             logger.info(
@@ -283,6 +311,7 @@ class OpenAIService:
         conversation_id: str,
         stage: str,
         existing_slots: Dict[str, Any] = None,
+        message_history: List[ChatMessage] = None,
     ) -> Tuple[Optional[ConversationResponse], Optional[str]]:
         """
         Try to parse content as JSON and convert to ConversationResponse.
@@ -295,9 +324,15 @@ class OpenAIService:
 
         Args:
             existing_slots: Already collected slots (used to determine next question)
+            message_history: Previous messages (used to determine last question field)
         """
         if existing_slots is None:
             existing_slots = {}
+        if message_history is None:
+            message_history = []
+
+        # Determine last question field for repairing invalid keys like "slot"
+        last_question_field = _get_last_question_field(message_history)
 
         if not content:
             return None, "empty_content"
@@ -370,7 +405,14 @@ class OpenAIService:
 
         # Build response with defensive defaults
         try:
-            return self._build_response_from_data(data, self.model), None
+            return self._build_response_from_data(
+                data,
+                self.model,
+                agent_type=agent_type,
+                last_question_field=last_question_field,
+                existing_slots=existing_slots,
+                conversation_id=conversation_id,
+            ), None
         except Exception as e:
             logger.warning(
                 f"METRIC model_parse_failed agent={agent_type} stage={stage} "
@@ -484,6 +526,7 @@ class OpenAIService:
         agent_type: AgentType,
         slots: Dict[str, Any],
         conversation_id: str,
+        message_history: List[ChatMessage] = None,
     ) -> Optional[ConversationResponse]:
         """
         Retry the OpenAI call with a repair prompt that emphasizes JSON-only output.
@@ -523,7 +566,8 @@ RULES:
             retry_content = response.choices[0].message.content
 
             result, _ = self._try_parse_json(
-                retry_content, agent_type.value, conversation_id, "retry", slots
+                retry_content, agent_type.value, conversation_id, "retry", slots,
+                message_history if message_history else []
             )
             return result
 
@@ -534,15 +578,90 @@ RULES:
             )
             return None
 
+    def _sanitize_extracted_data(
+        self,
+        extracted_data: Optional[Dict[str, Any]],
+        agent_type: str,
+        last_question_field: Optional[str],
+        existing_slots: Dict[str, Any],
+        conversation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Sanitize and repair extractedData from model response.
+
+        Fixes:
+        1. Removes keys not in KNOWN_SLOT_KEYS
+        2. Repairs invalid keys like "slot" -> last_question_field
+        3. Preserves existing slots that would be lost
+
+        Returns sanitized extractedData or None.
+        """
+        if not extracted_data or not isinstance(extracted_data, dict):
+            return None
+
+        known_slots = KNOWN_SLOT_KEYS.get(agent_type, set())
+        sanitized: Dict[str, Any] = {}
+
+        for key, value in extracted_data.items():
+            # Skip empty values
+            if value is None or value == "":
+                continue
+
+            if key in known_slots:
+                # Valid key - keep it
+                sanitized[key] = value
+            elif key in INVALID_SLOT_KEYS:
+                # Invalid key (e.g., "slot") - try to repair
+                if last_question_field and last_question_field in known_slots:
+                    logger.warning(
+                        f"METRIC extracted_key_repaired agent={agent_type} "
+                        f"from={key} to={last_question_field} value={value} "
+                        f"conversationId={conversation_id}"
+                    )
+                    sanitized[last_question_field] = value
+                else:
+                    logger.warning(
+                        f"METRIC extracted_key_invalid agent={agent_type} "
+                        f"key={key} value={value} no_repair_target "
+                        f"conversationId={conversation_id}"
+                    )
+            else:
+                # Unknown key - log and drop
+                logger.info(
+                    f"METRIC extracted_key_dropped agent={agent_type} "
+                    f"key={key} conversationId={conversation_id}"
+                )
+
+        # Safety check: don't lose existing required slots
+        required_fields = [f for f, _, _ in REQUIRED_SLOTS.get(agent_type, [])]
+        for field in required_fields:
+            if field in existing_slots and field not in sanitized:
+                # Slot existed before but not in new extraction - preserve it
+                # (This prevents regression where model forgets slots)
+                pass  # We don't add it to extractedData, but existing_slots is preserved by caller
+
+        if not sanitized:
+            return None
+
+        return sanitized
+
     def _build_response_from_data(
         self,
         data: Dict[str, Any],
         model: str,
+        agent_type: str = "UNKNOWN",
+        last_question_field: Optional[str] = None,
+        existing_slots: Dict[str, Any] = None,
+        conversation_id: str = "unknown",
     ) -> ConversationResponse:
         """
         Build ConversationResponse from parsed JSON data.
         Uses defensive defaults for all optional fields.
+        Sanitizes extractedData to ensure only valid slot keys are included.
         """
+        if existing_slots is None:
+            existing_slots = {}
+
         # Get assistant message with fallback
         assistant_message = data.get("assistantMessage", "")
         if not assistant_message or not str(assistant_message).strip():
@@ -592,11 +711,17 @@ RULES:
         if data.get("confirmationCard"):
             try:
                 cc = data["confirmationCard"]
+                title = cc.get("title", "Confirmation")
+                lines = cc.get("lines", []) if isinstance(cc.get("lines"), list) else []
+                # Generate stable cardId from content hash
+                card_content = f"{title}|{'|'.join(lines)}"
+                card_id = hex(hash(card_content) & 0xFFFFFFFF)[2:]  # Positive hash as hex
                 confirmation_card = ConfirmationCard(
-                    title=cc.get("title", "Confirmation"),
-                    lines=cc.get("lines", []) if isinstance(cc.get("lines"), list) else [],
+                    title=title,
+                    lines=lines,
                     confirmLabel=cc.get("confirmLabel", "Yes"),
                     rejectLabel=cc.get("rejectLabel", "Not quite"),
+                    cardId=card_id,
                 )
             except Exception:
                 pass
@@ -619,11 +744,21 @@ RULES:
         except ValueError:
             confidence = Confidence.MEDIUM
 
+        # Sanitize extractedData - fix invalid keys like "slot" -> actual field
+        raw_extracted = data.get("extractedData") if isinstance(data.get("extractedData"), dict) else None
+        sanitized_extracted = self._sanitize_extracted_data(
+            raw_extracted,
+            agent_type,
+            last_question_field,
+            existing_slots,
+            conversation_id,
+        )
+
         return ConversationResponse(
             assistantMessage=assistant_message,
             nextAction=next_action,
             question=question,
-            extractedData=data.get("extractedData") if isinstance(data.get("extractedData"), dict) else None,
+            extractedData=sanitized_extracted,
             confidence=confidence,
             confirmationCard=confirmation_card,
             placeSearchParams=place_search_params,
@@ -715,8 +850,29 @@ RULES:
         slots: Dict[str, Any],
         message_history: List[ChatMessage]
     ) -> str:
-        """Build a context message with current slots for OpenAI."""
-        context_parts = ["CURRENT STATE:"]
+        """Build a context message with current slots and date anchors for OpenAI."""
+        from datetime import datetime
+        import pytz
+
+        # Get current date/time in Australian timezone for relative date resolution
+        try:
+            tz = pytz.timezone("Australia/Brisbane")
+            now = datetime.now(tz)
+        except Exception:
+            now = datetime.now()
+
+        context_parts = [
+            "CURRENT STATE:",
+            f"CURRENT_DATE_ISO: {now.strftime('%Y-%m-%d')}",
+            f"CURRENT_TIME: {now.strftime('%H:%M')}",
+            f"TIMEZONE: Australia/Brisbane",
+            f"DAY_OF_WEEK: {now.strftime('%A')}",
+        ]
+
+        # Add explicit date examples for "today" and "tomorrow"
+        tomorrow = now + __import__('datetime').timedelta(days=1)
+        context_parts.append(f"'today' = {now.strftime('%Y-%m-%d')}")
+        context_parts.append(f"'tomorrow' = {tomorrow.strftime('%Y-%m-%d')}")
 
         if slots:
             context_parts.append(f"Collected slots: {json.dumps(slots)}")

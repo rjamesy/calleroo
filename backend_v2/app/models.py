@@ -62,6 +62,13 @@ class ConfirmationCard(BaseModel):
     lines: List[str]
     confirmLabel: str = "Yes"
     rejectLabel: str = "Not quite"
+    cardId: Optional[str] = None  # Stable ID for idempotency (auto-generated if not provided)
+
+
+class ClientAction(str, Enum):
+    """Client-initiated actions that bypass OpenAI."""
+    CONFIRM = "CONFIRM"  # User tapped "Yes, call them"
+    REJECT = "REJECT"    # User tapped "Not quite"
 
 
 class ConversationRequest(BaseModel):
@@ -71,6 +78,10 @@ class ConversationRequest(BaseModel):
     slots: Dict[str, Any] = Field(default_factory=dict)
     messageHistory: List[ChatMessage] = Field(default_factory=list)
     debug: bool = False
+    # Optional client action for deterministic handling (bypasses OpenAI)
+    clientAction: Optional[ClientAction] = None
+    # Idempotency key to prevent duplicate actions (e.g., double-tap confirm)
+    idempotencyKey: Optional[str] = None
 
 
 class PlaceSearchParams(BaseModel):

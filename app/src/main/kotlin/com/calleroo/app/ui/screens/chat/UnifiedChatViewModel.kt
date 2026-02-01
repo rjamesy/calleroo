@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.calleroo.app.domain.model.AgentType
 import com.calleroo.app.domain.model.ChatMessage
+import com.calleroo.app.domain.model.ClientAction
 import com.calleroo.app.domain.model.ConversationResponse
 import com.calleroo.app.domain.model.NextAction
 import com.calleroo.app.repository.ConversationRepository
@@ -103,8 +104,8 @@ class UnifiedChatViewModel @Inject constructor(
 
             result.fold(
                 onSuccess = { response ->
-                    // CRITICAL: Verify backend drove this response
-                    UnifiedConversationGuard.assertBackendDriven(response.aiCallMade)
+                    // CRITICAL: Verify backend drove this response (allows deterministic responses)
+                    UnifiedConversationGuard.assertBackendDriven(response.aiCallMade, response.aiModel)
 
                     // Logging for debugging (non-PII)
                     Log.d(TAG, "Backend response: action=${response.nextAction}, aiModel=${response.aiModel}")
@@ -132,8 +133,10 @@ class UnifiedChatViewModel @Inject constructor(
                             slots = newSlots,
                             currentQuestion = sanitized.question,
                             confirmationCard = sanitized.confirmationCard,
+                            confirmationCardId = sanitized.confirmationCard?.cardId,
                             nextAction = sanitized.nextAction,
                             isLoading = false,
+                            isConfirmationSubmitting = false,
                             isComplete = sanitized.isComplete,
                             placeSearchParams = sanitized.placeSearchParams
                         )
@@ -154,12 +157,109 @@ class UnifiedChatViewModel @Inject constructor(
 
     /**
      * Handle confirmation card response.
-     * "Yes" sends "yes" to backend.
-     * "Not quite" sends "no" to backend.
+     * Uses deterministic clientAction to bypass OpenAI and prevent loops.
+     * "Yes" sends clientAction=CONFIRM to backend.
+     * "Not quite" sends clientAction=REJECT to backend.
      */
     fun handleConfirmation(confirmed: Boolean) {
-        val response = if (confirmed) "yes" else "no"
-        sendMessage(response)
+        val stateSnapshot = _uiState.value
+
+        // Guard: prevent double-submission
+        if (stateSnapshot.isConfirmationSubmitting) {
+            Log.w(TAG, "handleConfirmation: already submitting, ignoring")
+            return
+        }
+
+        val clientAction = if (confirmed) ClientAction.CONFIRM else ClientAction.REJECT
+
+        // Generate stable idempotency key from card ID + action
+        // If backend doesn't provide cardId, hash the card content
+        val cardId = stateSnapshot.confirmationCardId
+            ?: stateSnapshot.confirmationCard?.let { generateCardId(it) }
+            ?: UUID.randomUUID().toString()
+        val actionSuffix = if (confirmed) "CONFIRM" else "REJECT"
+        val idempotencyKey = "confirm:${stateSnapshot.conversationId}:$cardId:$actionSuffix"
+
+        Log.d(TAG, "handleConfirmation: confirmed=$confirmed, clientAction=$clientAction, idempotencyKey=$idempotencyKey")
+
+        // Show "Calling..." state - keep card visible but disable buttons
+        _uiState.update {
+            it.copy(
+                isConfirmationSubmitting = true,
+                error = null
+            )
+        }
+
+        viewModelScope.launch {
+            val result = conversationRepository.nextTurn(
+                conversationId = stateSnapshot.conversationId,
+                agentType = stateSnapshot.agentType,
+                userMessage = "",  // Empty - clientAction handles the intent
+                slots = stateSnapshot.slots,
+                messageHistory = messageHistory.toList(),
+                debug = true,
+                clientAction = clientAction,
+                idempotencyKey = idempotencyKey
+            )
+
+            result.fold(
+                onSuccess = { response ->
+                    // Verify backend drove this response (allows deterministic responses)
+                    UnifiedConversationGuard.assertBackendDriven(response.aiCallMade, response.aiModel)
+
+                    Log.d(TAG, "Confirmation response: action=${response.nextAction}, aiCallMade=${response.aiCallMade}, aiModel=${response.aiModel}")
+
+                    // Sanitize response
+                    val sanitized = sanitizeResponse(response, stateSnapshot.conversationId)
+
+                    val assistantMessageUi = ChatMessageUi(
+                        id = UUID.randomUUID().toString(),
+                        content = sanitized.assistantMessage,
+                        isUser = false
+                    )
+
+                    messageHistory.add(ChatMessage(role = "assistant", content = sanitized.assistantMessage))
+
+                    // Merge extracted data into slots (not replace!)
+                    val latestSlots = _uiState.value.slots
+                    val newSlots = mergeSlots(latestSlots, sanitized.extractedData)
+
+                    _uiState.update {
+                        it.copy(
+                            messages = it.messages + assistantMessageUi,
+                            slots = newSlots,
+                            currentQuestion = sanitized.question,
+                            confirmationCard = sanitized.confirmationCard,
+                            confirmationCardId = sanitized.confirmationCard?.cardId,
+                            nextAction = sanitized.nextAction,
+                            isLoading = false,
+                            isConfirmationSubmitting = false,
+                            isComplete = sanitized.isComplete,
+                            placeSearchParams = sanitized.placeSearchParams
+                        )
+                    }
+                },
+                onFailure = { throwable ->
+                    Log.e(TAG, "Confirmation error", throwable)
+                    // On error, keep the card visible so user can retry
+                    _uiState.update {
+                        it.copy(
+                            isConfirmationSubmitting = false,
+                            error = throwable.message ?: "Unknown error occurred"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    /**
+     * Generate a stable card ID by hashing the card content.
+     * Used for idempotency when backend doesn't provide cardId.
+     */
+    private fun generateCardId(card: com.calleroo.app.domain.model.ConfirmationCard): String {
+        val content = "${card.title}|${card.lines.joinToString("|")}"
+        return content.hashCode().toString(16)
     }
 
     fun clearError() {

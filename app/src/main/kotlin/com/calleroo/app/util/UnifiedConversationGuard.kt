@@ -34,14 +34,22 @@ object UnifiedConversationGuard {
     }
 
     /**
-     * Validates that a response came from the backend (aiCallMade == true).
-     * Crashes in debug builds if the response doesn't have aiCallMade flag.
+     * Validates that a response came from the backend.
+     * aiCallMade can be false for deterministic responses (e.g., CONFIRM/REJECT)
+     * that bypass OpenAI but still come from the backend.
+     *
+     * @param aiCallMade Whether OpenAI was called
+     * @param aiModel The model that generated the response ("deterministic" for clientAction responses)
      */
-    fun assertBackendDriven(aiCallMade: Boolean) {
+    fun assertBackendDriven(aiCallMade: Boolean, aiModel: String = "") {
         if (BuildConfig.ENABLE_LOCAL_LOGIC_GUARD && !aiCallMade) {
+            // Allow deterministic responses from backend (clientAction=CONFIRM/REJECT)
+            if (aiModel == "deterministic") {
+                return  // Backend deterministic response is OK
+            }
             throw RuntimeException(
                 "LOCAL_LOGIC_FORBIDDEN: Response did not come from AI backend. " +
-                        "aiCallMade must be true for all responses."
+                        "aiCallMade must be true for all responses (except deterministic)."
             )
         }
     }

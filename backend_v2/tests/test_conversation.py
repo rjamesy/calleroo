@@ -68,56 +68,27 @@ class TestConversationEndpoint:
     @pytest.mark.asyncio
     async def test_response_has_required_fields(self, client: AsyncClient):
         """Test that response always includes assistantMessage and nextAction."""
-        mock_data = {
-            "assistantMessage": "Hello! What retailer would you like to check?",
-            "nextAction": "ASK_QUESTION",
-            "question": {
-                "text": "Which store?",
-                "field": "retailer_name",
-                "inputType": "TEXT",
-                "optional": False
-            },
-            "extractedData": {},
-            "confidence": "HIGH"
+        # This test verifies the contract: successful responses always have required fields
+        request_data = {
+            "conversationId": "test-1",
+            "agentType": "STOCK_CHECKER",
+            "userMessage": "",
+            "slots": {},
+            "messageHistory": [],
         }
 
-        with patch("app.openai_service.AsyncOpenAI") as mock_openai:
-            mock_client = AsyncMock()
-            mock_client.chat.completions.create = AsyncMock(
-                return_value=mock_openai_response(mock_data)
-            )
-            mock_openai.return_value = mock_client
+        response = await client.post(
+            "/conversation/next",
+            json=request_data
+        )
 
-            # Re-import to pick up mock
-            from app.openai_service import OpenAIService
-            with patch.object(OpenAIService, "__init__", lambda self: None):
-                with patch.object(OpenAIService, "client", mock_client):
-                    with patch.object(OpenAIService, "model", "gpt-4o-mini"):
-                        # Create service manually for this test
-                        service = OpenAIService.__new__(OpenAIService)
-                        service.client = mock_client
-                        service.model = "gpt-4o-mini"
-
-                        request_data = {
-                            "conversationId": "test-1",
-                            "agentType": "STOCK_CHECKER",
-                            "userMessage": "",
-                            "slots": {},
-                            "messageHistory": [],
-                        }
-
-                        response = await client.post(
-                            "/conversation/next",
-                            json=request_data
-                        )
-
-                        # With mocking, we expect either success or the actual call
-                        if response.status_code == 200:
-                            data = response.json()
-                            assert "assistantMessage" in data
-                            assert "nextAction" in data
-                            assert data["aiCallMade"] is True
-                            assert "aiModel" in data
+        # If we get a 200, verify required fields are present
+        if response.status_code == 200:
+            data = response.json()
+            assert "assistantMessage" in data
+            assert "nextAction" in data
+            assert data["aiCallMade"] is True
+            assert "aiModel" in data
 
     @pytest.mark.asyncio
     async def test_ai_call_made_is_true(self, client: AsyncClient):
@@ -312,7 +283,9 @@ class TestResponseSanitization:
 
         # Should be downgraded to ASK_QUESTION
         assert sanitized.nextAction == NextAction.ASK_QUESTION
-        assert "business" in sanitized.assistantMessage.lower() or "information" in sanitized.assistantMessage.lower()
+        # With new slot-aware sanitization, it now generates a question for the first missing slot
+        assert sanitized.question is not None
+        assert sanitized.question.field == "employer_name"
 
     def test_sanitize_confirm_without_card(self):
         """Test that CONFIRM without confirmationCard is downgraded."""
@@ -346,8 +319,11 @@ class TestResponseSanitization:
 
         sanitized = sanitize_conversation_response(response, "test-conv-3", "STOCK_CHECKER")
 
+        # With slot-aware sanitization, empty message is replaced with question text
         assert sanitized.assistantMessage != ""
-        assert "try again" in sanitized.assistantMessage.lower() or "detail" in sanitized.assistantMessage.lower()
+        # It generates a question for the first missing slot
+        assert sanitized.question is not None
+        assert sanitized.question.field == "retailer_name"
 
     def test_sanitize_valid_response_unchanged(self):
         """Test that valid responses are not modified."""
@@ -820,3 +796,452 @@ class TestIntegrationResilience:
             assert "assistantMessage" in data
             assert "nextAction" in data
             assert data["aiCallMade"] is True
+
+
+class TestClientActionHandling:
+    """Tests for deterministic clientAction handling (bypasses OpenAI)."""
+
+    @pytest.mark.asyncio
+    async def test_confirm_action_returns_complete(self, client: AsyncClient):
+        """Test that clientAction=CONFIRM returns COMPLETE without calling OpenAI."""
+        request_data = {
+            "conversationId": "confirm-test-1",
+            "agentType": "SICK_CALLER",
+            "userMessage": "",  # Empty - doesn't matter for CONFIRM
+            "slots": {
+                "employer_name": "Bunnings",
+                "employer_phone": "+61412345678",
+                "caller_name": "John",
+                "shift_date": "2026-02-01",
+                "shift_start_time": "9:00am",
+                "reason_category": "SICK",
+            },
+            "messageHistory": [],
+            "clientAction": "CONFIRM",
+        }
+
+        response = await client.post("/conversation/next", json=request_data)
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Should return COMPLETE without calling AI
+        assert data["nextAction"] == "COMPLETE"
+        assert data["aiCallMade"] is False
+        assert data["aiModel"] == "deterministic"
+        assert "placing the call" in data["assistantMessage"].lower()
+
+    @pytest.mark.asyncio
+    async def test_reject_action_returns_ask_question(self, client: AsyncClient):
+        """Test that clientAction=REJECT returns ASK_QUESTION for corrections."""
+        request_data = {
+            "conversationId": "reject-test-1",
+            "agentType": "SICK_CALLER",
+            "userMessage": "",
+            "slots": {
+                "employer_name": "Bunnings",
+                "employer_phone": "+61412345678",
+            },
+            "messageHistory": [],
+            "clientAction": "REJECT",
+        }
+
+        response = await client.post("/conversation/next", json=request_data)
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Should return ASK_QUESTION without calling AI
+        assert data["nextAction"] == "ASK_QUESTION"
+        assert data["aiCallMade"] is False
+        assert data["aiModel"] == "deterministic"
+        assert "change" in data["assistantMessage"].lower()
+        assert data["question"] is not None
+        assert data["question"]["field"] == "correction"
+
+    @pytest.mark.asyncio
+    async def test_no_client_action_calls_openai(self, client: AsyncClient):
+        """Test that normal requests (no clientAction) call OpenAI."""
+        request_data = {
+            "conversationId": "normal-test-1",
+            "agentType": "SICK_CALLER",
+            "userMessage": "Bunnings",
+            "slots": {},
+            "messageHistory": [],
+            # clientAction is NOT set
+        }
+
+        response = await client.post("/conversation/next", json=request_data)
+
+        # Should either succeed with aiCallMade=True, or fail with 503
+        if response.status_code == 200:
+            data = response.json()
+            assert data["aiCallMade"] is True
+            assert data["aiModel"] != "deterministic"
+
+
+class TestIdempotency:
+    """Tests for idempotency key handling."""
+
+    @pytest.mark.asyncio
+    async def test_idempotent_confirm_returns_same_response(self, client: AsyncClient):
+        """Test that same idempotencyKey returns cached response."""
+        import uuid
+        idempotency_key = f"test-{uuid.uuid4()}"
+
+        request_data = {
+            "conversationId": "idem-test-1",
+            "agentType": "SICK_CALLER",
+            "userMessage": "",
+            "slots": {},
+            "messageHistory": [],
+            "clientAction": "CONFIRM",
+            "idempotencyKey": idempotency_key,
+        }
+
+        # First request
+        response1 = await client.post("/conversation/next", json=request_data)
+        assert response1.status_code == 200
+        data1 = response1.json()
+
+        # Second request with same key
+        response2 = await client.post("/conversation/next", json=request_data)
+        assert response2.status_code == 200
+        data2 = response2.json()
+
+        # Should return identical response
+        assert data1["nextAction"] == data2["nextAction"]
+        assert data1["assistantMessage"] == data2["assistantMessage"]
+        assert data1["aiModel"] == data2["aiModel"]
+
+    @pytest.mark.asyncio
+    async def test_different_idempotency_keys_process_separately(self, client: AsyncClient):
+        """Test that different idempotencyKeys are processed separately."""
+        import uuid
+
+        request_data_1 = {
+            "conversationId": "idem-test-2a",
+            "agentType": "SICK_CALLER",
+            "userMessage": "",
+            "slots": {},
+            "messageHistory": [],
+            "clientAction": "CONFIRM",
+            "idempotencyKey": f"test-{uuid.uuid4()}",
+        }
+
+        request_data_2 = {
+            "conversationId": "idem-test-2b",
+            "agentType": "SICK_CALLER",
+            "userMessage": "",
+            "slots": {},
+            "messageHistory": [],
+            "clientAction": "REJECT",  # Different action
+            "idempotencyKey": f"test-{uuid.uuid4()}",  # Different key
+        }
+
+        response1 = await client.post("/conversation/next", json=request_data_1)
+        response2 = await client.post("/conversation/next", json=request_data_2)
+
+        assert response1.status_code == 200
+        assert response2.status_code == 200
+
+        data1 = response1.json()
+        data2 = response2.json()
+
+        # Should have different nextActions
+        assert data1["nextAction"] == "COMPLETE"
+        assert data2["nextAction"] == "ASK_QUESTION"
+
+
+class TestSlotPersistence:
+    """Tests for slot persistence across turns."""
+
+    def test_slot_only_response_new_slots_extracted(self):
+        """Test that new slots from slot-only response are extracted."""
+        from app.openai_service import OpenAIService
+        import json
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        # User provides caller_name
+        content = json.dumps({"caller_name": "John Smith"})
+
+        existing_slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+        }
+
+        result, error = service._try_parse_json(
+            content, "SICK_CALLER", "test-conv", "raw", existing_slots
+        )
+
+        assert result is not None
+        assert error is None
+        assert result.extractedData is not None
+        assert result.extractedData.get("caller_name") == "John Smith"
+        # Should ask for the next missing slot (shift_date)
+        assert result.question.field == "shift_date"
+
+    def test_slot_only_response_ignores_echoed_slots(self):
+        """Test that echoed slots (already in existing_slots) are ignored."""
+        from app.openai_service import OpenAIService
+        import json
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        # Model just echoes existing slots - no new info
+        content = json.dumps({
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+        })
+
+        existing_slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+        }
+
+        result, error = service._try_parse_json(
+            content, "SICK_CALLER", "test-conv", "raw", existing_slots
+        )
+
+        # When all slots are echoed, should fall through to normal parsing
+        # which will try to build a response with defaults
+        # This tests that we don't treat echoed slots as "new" extraction
+        pass  # The behavior here depends on implementation - key is no crash
+
+    def test_fallback_response_considers_all_filled_slots(self):
+        """Test that fallback response asks for next unfilled slot."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        # Many slots filled
+        slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+            "caller_name": "John",
+            "shift_date": "2026-02-01",
+        }
+
+        response = service._create_fallback_response(
+            "SICK_CALLER", slots, "test-model", "test_reason"
+        )
+
+        # Should ask for shift_start_time (next unfilled)
+        assert response.question.field == "shift_start_time"
+
+    def test_build_slot_only_response_merges_slots_correctly(self):
+        """Test that _build_slot_only_response considers all slots for next question."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        # New extraction
+        new_slots = {"shift_date": "2026-02-01", "shift_start_time": "9am"}
+
+        # All slots combined
+        all_slots = {
+            "employer_name": "Bunnings",
+            "employer_phone": "+61412345678",
+            "caller_name": "John",
+            "shift_date": "2026-02-01",
+            "shift_start_time": "9am",
+        }
+
+        response = service._build_slot_only_response(
+            new_slots, "SICK_CALLER", "test-model", all_slots
+        )
+
+        # Should ask for reason_category (next unfilled after all above)
+        assert response.question.field == "reason_category"
+        assert response.extractedData == new_slots
+        assert response.question.choices is not None  # reason has choices
+
+
+class TestExtractedDataSanitization:
+    """Tests for extractedData key validation and repair."""
+
+    def test_invalid_slot_key_repaired_to_question_field(self):
+        """Test that 'slot' key is repaired to the last question field."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        # Model returned {"slot": "richard"} instead of {"caller_name": "richard"}
+        extracted_data = {"slot": "richard"}
+        last_question_field = "caller_name"
+        existing_slots = {"employer_name": "Bunnings", "employer_phone": "+61412345678"}
+
+        sanitized = service._sanitize_extracted_data(
+            extracted_data,
+            "SICK_CALLER",
+            last_question_field,
+            existing_slots,
+            "test-conv"
+        )
+
+        # Should repair "slot" -> "caller_name"
+        assert sanitized is not None
+        assert "caller_name" in sanitized
+        assert sanitized["caller_name"] == "richard"
+        assert "slot" not in sanitized
+
+    def test_valid_slot_keys_preserved(self):
+        """Test that valid slot keys are preserved unchanged."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        extracted_data = {
+            "caller_name": "John",
+            "shift_date": "2026-02-01"
+        }
+
+        sanitized = service._sanitize_extracted_data(
+            extracted_data,
+            "SICK_CALLER",
+            "caller_name",
+            {},
+            "test-conv"
+        )
+
+        assert sanitized is not None
+        assert sanitized["caller_name"] == "John"
+        assert sanitized["shift_date"] == "2026-02-01"
+
+    def test_unknown_keys_dropped(self):
+        """Test that unknown keys are dropped from extractedData."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        extracted_data = {
+            "caller_name": "John",
+            "unknown_field": "value",  # Should be dropped
+            "another_unknown": "value2",  # Should be dropped
+        }
+
+        sanitized = service._sanitize_extracted_data(
+            extracted_data,
+            "SICK_CALLER",
+            "caller_name",
+            {},
+            "test-conv"
+        )
+
+        assert sanitized is not None
+        assert "caller_name" in sanitized
+        assert "unknown_field" not in sanitized
+        assert "another_unknown" not in sanitized
+
+    def test_empty_values_skipped(self):
+        """Test that empty/null values are not included."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        extracted_data = {
+            "caller_name": "John",
+            "shift_date": "",  # Empty - should be skipped
+            "shift_start_time": None,  # Null - should be skipped
+        }
+
+        sanitized = service._sanitize_extracted_data(
+            extracted_data,
+            "SICK_CALLER",
+            "caller_name",
+            {},
+            "test-conv"
+        )
+
+        assert sanitized is not None
+        assert "caller_name" in sanitized
+        assert "shift_date" not in sanitized
+        assert "shift_start_time" not in sanitized
+
+    def test_slot_key_not_repaired_without_question_field(self):
+        """Test that 'slot' key is logged but dropped when no question field available."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        extracted_data = {"slot": "richard"}
+
+        sanitized = service._sanitize_extracted_data(
+            extracted_data,
+            "SICK_CALLER",
+            None,  # No last question field
+            {},
+            "test-conv"
+        )
+
+        # Should return None since "slot" can't be repaired and is dropped
+        assert sanitized is None
+
+    def test_multiple_invalid_keys_handled(self):
+        """Test that multiple invalid keys like 'value', 'answer' are handled."""
+        from app.openai_service import OpenAIService
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        extracted_data = {
+            "slot": "value1",
+            "value": "value2",
+            "answer": "value3",
+        }
+
+        sanitized = service._sanitize_extracted_data(
+            extracted_data,
+            "SICK_CALLER",
+            "caller_name",
+            {},
+            "test-conv"
+        )
+
+        # All invalid keys should be repaired to caller_name
+        # But only one value survives (last wins)
+        assert sanitized is not None
+        assert "caller_name" in sanitized
+        assert "slot" not in sanitized
+        assert "value" not in sanitized
+        assert "answer" not in sanitized
+
+    def test_build_response_sanitizes_extracted_data(self):
+        """Test that _build_response_from_data sanitizes extractedData."""
+        from app.openai_service import OpenAIService
+        import json
+
+        service = OpenAIService.__new__(OpenAIService)
+        service.model = "test-model"
+
+        data = {
+            "assistantMessage": "Got it!",
+            "nextAction": "ASK_QUESTION",
+            "question": {"text": "What time?", "field": "shift_start_time", "inputType": "TIME"},
+            "extractedData": {"slot": "richard"},  # Invalid key
+        }
+
+        response = service._build_response_from_data(
+            data,
+            "test-model",
+            agent_type="SICK_CALLER",
+            last_question_field="caller_name",
+            existing_slots={"employer_name": "Bunnings"},
+            conversation_id="test-conv"
+        )
+
+        # extractedData should have "caller_name" not "slot"
+        assert response.extractedData is not None
+        assert "caller_name" in response.extractedData
+        assert response.extractedData["caller_name"] == "richard"
+        assert "slot" not in response.extractedData

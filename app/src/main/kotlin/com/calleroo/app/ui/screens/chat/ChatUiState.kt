@@ -31,8 +31,10 @@ data class ChatUiState(
     val slots: JsonObject = buildJsonObject {},
     val currentQuestion: Question? = null,
     val confirmationCard: ConfirmationCard? = null,
+    val confirmationCardId: String? = null,  // Stable ID for idempotency
     val nextAction: NextAction? = null,
     val isLoading: Boolean = false,
+    val isConfirmationSubmitting: Boolean = false,  // True while awaiting CONFIRM/REJECT response
     val error: String? = null,
     val isComplete: Boolean = false,
     val placeSearchParams: PlaceSearchParams? = null

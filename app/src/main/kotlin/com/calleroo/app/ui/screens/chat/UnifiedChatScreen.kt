@@ -200,12 +200,13 @@ fun UnifiedChatScreen(
 
             // Confirmation card (when backend returns CONFIRM)
             uiState.confirmationCard?.let { card ->
-                if (uiState.showConfirmationCard) {
+                if (uiState.showConfirmationCard || uiState.isConfirmationSubmitting) {
                     ConfirmationCardUi(
                         card = card,
                         onConfirm = { viewModel.handleConfirmation(true) },
                         onReject = { viewModel.handleConfirmation(false) },
-                        enabled = !uiState.isLoading
+                        enabled = !uiState.isLoading && !uiState.isConfirmationSubmitting,
+                        isSubmitting = uiState.isConfirmationSubmitting
                     )
                 }
             }
@@ -323,7 +324,8 @@ private fun ConfirmationCardUi(
     card: ConfirmationCard,
     onConfirm: () -> Unit,
     onReject: () -> Unit,
-    enabled: Boolean
+    enabled: Boolean,
+    isSubmitting: Boolean = false
 ) {
     Card(
         modifier = Modifier
@@ -357,24 +359,46 @@ private fun ConfirmationCardUi(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                OutlinedButton(
-                    onClick = onReject,
-                    enabled = enabled,
-                    modifier = Modifier.weight(1f)
+            if (isSubmitting) {
+                // Show "Calling..." state with spinner
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(card.rejectLabel)
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        text = "Calling...",
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
                 }
-
-                Button(
-                    onClick = onConfirm,
-                    enabled = enabled,
-                    modifier = Modifier.weight(1f)
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text(card.confirmLabel)
+                    OutlinedButton(
+                        onClick = onReject,
+                        enabled = enabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(card.rejectLabel)
+                    }
+
+                    Button(
+                        onClick = onConfirm,
+                        enabled = enabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(card.confirmLabel)
+                    }
                 }
             }
         }

@@ -55,6 +55,18 @@ enum class Confidence {
     HIGH
 }
 
+/**
+ * Client-initiated actions that bypass OpenAI for deterministic handling.
+ */
+@Serializable
+enum class ClientAction {
+    @SerialName("CONFIRM")
+    CONFIRM,  // User tapped "Yes, call them"
+
+    @SerialName("REJECT")
+    REJECT    // User tapped "Not quite"
+}
+
 @Serializable
 data class Choice(
     val label: String,
@@ -75,7 +87,9 @@ data class ConfirmationCard(
     val title: String = "",
     val lines: List<String> = emptyList(),
     val confirmLabel: String = "Yes",
-    val rejectLabel: String = "Not quite"
+    val rejectLabel: String = "Not quite",
+    // Stable ID for idempotency (hash of card content if not provided by backend)
+    val cardId: String? = null
 )
 
 /**
@@ -101,7 +115,11 @@ data class ConversationRequest(
     val userMessage: String,
     val slots: JsonObject,
     val messageHistory: List<ChatMessage>,
-    val debug: Boolean = false
+    val debug: Boolean = false,
+    // Optional client action for deterministic handling (bypasses OpenAI)
+    val clientAction: ClientAction? = null,
+    // Idempotency key to prevent duplicate actions (e.g., double-tap confirm)
+    val idempotencyKey: String? = null
 )
 
 @Serializable
